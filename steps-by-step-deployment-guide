@@ -1,0 +1,84 @@
+## Step-by-Step Deployment Guide (Beginner Walkthrough)
+
+Follow these steps in order. No prior coding experience or familiarity with Google Apps Script is required.
+
+### Step 1: Create a Dedicated Google Sheet
+1. Open Google Chrome and log in with your administrative Google Workspace account.
+2. Navigate to `https://sheets.new` in your address bar to create a blank Google Sheet.
+3. Click on the document title in the top-left corner (default is **Untitled spreadsheet**) and rename it to:
+   ```text
+   Google Workspace Executive Governance & Usage Report
+   ```
+
+### Step 2: Open the Apps Script Editor
+1. In the top navigation bar of your Google Sheet, click **Extensions**.
+2. In the dropdown menu, click **Apps Script**.
+3. A new browser tab will open displaying the Google Apps Script development environment.
+4. In the upper-left corner of the editor, click **Untitled project**, enter `Workspace Telemetry Suite`, and click **Rename**.
+
+### Step 3: Configure the Script Manifest (`appsscript.json`)
+The script manifest is a configuration file that registers the exact OAuth security scopes required to communicate with Google's administrative APIs.
+
+1. In the left-hand navigation sidebar of the Apps Script editor, click the **Project Settings** icon (the gear symbol ⚙️).
+2. Under the **General settings** section, locate the checkbox titled:
+   `Show "appsscript.json" manifest file in editor`.
+3. Click the checkbox to turn it on (checked).
+4. Return to the file editor by clicking the **Editor** icon (the code brackets `< >`) at the top of the left sidebar.
+5. You will now see two files listed in the **Files** section: `Code.gs` and `appsscript.json`.
+6. Click on **`appsscript.json`** to open it.
+7. Select and delete all existing code inside `appsscript.json`.
+8. Copy the entire JSON block below and paste it into `appsscript.json`: 
+See appscript.json file.
+
+
+9. Click the **Save** icon (disk symbol 💾) or press `Ctrl + S` (`Cmd + S` on macOS).
+
+### Step 4: Verify Advanced Google Services
+1. In the left-hand navigation bar, look at the **Services** section (located directly below the Files list).
+2. Verify that **AdminDirectory** and **AdminLicenseManager** appear in the list.
+3. If they do not appear automatically:
+   * Click the **+** (Add a service) button next to **Services**.
+   * Scroll down, select **Admin SDK API**, verify the Identifier is `AdminDirectory`, and click **Add**.
+   * Click the **+** button again, select **Enterprise License Manager API**, verify the Identifier is `AdminLicenseManager`, and click **Add**.
+
+### Step 5: Implement the Automation Script (`Code.gs`)
+1. In the left sidebar under **Files**, click on **`Code.gs`**.
+2. Select all placeholder text inside the file and delete it.
+3. Copy the production code block below in its entirety and paste it into `Code.gs`:
+See code.gs file.
+
+
+
+4. Click the **Save** icon (💾) or press `Ctrl + S` (`Cmd + S`).
+
+### Step 6: Initial Execution & Granting OAuth Consent
+To allow the script to read directory metadata and usage reports, Google requires an explicit, one-time administrator authorization.
+
+1. At the top of the Apps Script editor, locate the **Run / Debug** toolbar.
+2. Verify that the function dropdown displays:
+   `generateDomainUsageReport`
+3. Click the **Run** button (▶️).
+4. An **Authorization required** popup window will appear. Click **Review permissions**.
+5. Select your Google Workspace Administrator account.
+6. **Google Security Warning Screen:**
+   Because this script is created directly within your organization's tenant and has not been submitted for public Marketplace review, Google displays:
+   `Google hasn’t verified this app`.
+   * Click the small text link that says **Advanced** in the lower-left corner of the dialog.
+   * Click **Go to Workspace Telemetry Suite (unsafe)** at the bottom. *(Note: This warning is standard for custom internal tenant automations).*
+7. The permissions consent screen will display the exact scopes requested:
+   * Connect to an external service (`UrlFetchApp`).
+   * View customer usage reports for your domain.
+   * View customers and user info on your domain.
+   * View and manage license assignments.
+   * See, edit, create, and delete your spreadsheets.
+8. Click **Allow**.
+9. The script will execute. You will see an **Execution log** stream in the bottom panel. Within 15–30 seconds, an administrative alert will indicate successful completion.
+
+### Step 7: Running via the Custom Spreadsheet Menu
+Once authorized, you never need to open the Apps Script editor again.
+
+1. Return to your Google Sheet browser tab and refresh the page (`F5` or `Ctrl + R`).
+2. In the top spreadsheet menu (next to *Help*), a new native menu will appear:
+   **Workspace Governance**
+3. Click **Workspace Governance** > **Generate Complete Usage & Subscription Report**.
+4. The script will run in the background, pull the latest reconciled telemetry, and refresh all three tabs automatically.
