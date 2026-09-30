@@ -1,0 +1,16 @@
+## Operational FAQ & Technical Troubleshooting
+
+#### Q1: Why do some adoption metrics report fewer users than total employees?
+Application usage telemetry captures active users who performed actions in the past 28–30 days. Non-collaborating accounts (e.g., service accounts, shared mailboxes, or dormant accounts) will not increment 28-day active usage counters.
+
+#### Q2: What is the difference between Assigned Seats and Total Paid Seats?
+* **Assigned Seats (Directory):** The number of individual user accounts currently provisioned in your directory.
+* **Total Paid Seats (Subscription):** Your contractual commitment pool negotiated with Google. The difference represents unassigned headroom ready for immediate onboarding.
+
+#### Q3: Does the script capture custom, demo, or unlisted SKUs?
+Yes. The script queries the Enterprise License Manager API dynamically without applying lookup filters. Any custom SKU, internal demo plan, or newly released Google product will populate with its exact runtime `productId`, `skuId`, and `skuName`.
+
+#### Q4: How does data latency impact the reports?
+Google aggregates customer usage reports on a rolling batch schedule with an inherent 24–72 hour aggregation window. The script traverses the past 30 days and selects the most recent date with complete domain data.
+
+---
