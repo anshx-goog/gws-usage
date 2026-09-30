@@ -1,0 +1,13 @@
+## Automated Scheduling (Optional Time-Driven Trigger)
+
+To automate this report so it generates every Monday morning without human intervention:
+
+1. In the Apps Script editor, click the **Triggers** icon (the alarm clock ⏰) on the left sidebar.
+2. Click **+ Add Trigger** in the bottom-right corner.
+3. Configure the trigger:
+   * **Choose which function to run:** `generateDomainUsageReport`
+   * **Select event source:** `Time-driven`
+   * **Select type of time based trigger:** `Week timer`
+   * **Select day of week:** `Every Monday`
+   * **Select time of day:** `6am to 7am`
+4. Click **Save**. The dashboard will now automatically refresh weekly.
