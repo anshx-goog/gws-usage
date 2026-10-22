@@ -77,8 +77,11 @@ To allow the script to read directory metadata and usage reports, Google require
 ### Step 7: Running via the Custom Spreadsheet Menu
 Once authorized, you never need to open the Apps Script editor again.
 
-1. Return to your Google Sheet browser tab and refresh the page (`F5` or `Ctrl + R`).
+1. Return to your Google Sheet browser tab and refresh the page (`F5` or `Cmd + R`).
 2. In the top spreadsheet menu (next to *Help*), a new native menu will appear:
-   **Workspace Governance**
-3. Click **Workspace Governance** > **Generate Complete Usage & Subscription Report**.
-4. The script will run in the background, pull the latest reconciled telemetry, and refresh all three tabs automatically.
+   **🏢 Workspace Usage Report**
+3. Select any of the operational modes:
+   * **▶️ Generate Core Workspace Usage Report (Fast Overview)**: Fast executive overview across all 9 core Workspace services (Gmail, Calendar, Drive, Docs, Sheets, Slides, Chat, Meet, Contacts) with multi-domain breakdowns and licensing, completed in seconds without heavy meeting audit overhead.
+   * **📹 Generate Granular Meet Usage Report**: Deep dive into Google Meet conferences (screen sharing %, recording %, livestream %, >100 participant calls) with a dedicated *Meet Usage Deep-Dive* sheet.
+   * **🔄 Generate Complete Report (Core Services + Granular Meet)**: Generates both the core services overview and granular Meet conference telemetry in a single run.
+   * **🌐 Generate Individual Scorecard Tabs Per Domain**: Generates the complete overview plus dedicated scorecard tabs for every individual secondary/alias domain.
