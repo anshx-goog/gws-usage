@@ -13,4 +13,9 @@ Yes. The script queries the Enterprise License Manager API dynamically without a
 #### Q4: How does data latency impact the reports?
 Google aggregates customer usage reports on a rolling batch schedule with an inherent 24–72 hour aggregation window. The script traverses the past 30 days and selects the most recent date with complete domain data.
 
+#### Q5: Where does the "Data as of [Date]" get fetched from?
+The date displayed at the top of the Adoption Scorecard and Multi-Domain Breakdown (e.g., "Data as of Oct 20, 2026") represents the most recent date for which Google has finalized and published usage reports for your tenant.
+* **Why it lags by 2–3 days:** Google Workspace Reports API (`CustomerUsageReports` and `UserUsageReport`) runs global asynchronous batch ETL pipelines. Aggregated usage metrics for "today" or "yesterday" are not published in real time.
+* **How it is determined:** The function `findLatestAvailableReportDate_()` inspects dates starting from 2 days ago (`INITIAL_LAG_DAYS = 2`). The first date that returns populated metrics from `AdminReports.CustomerUsageReports.get(date)` becomes the anchor report date, and the 28-day window is calculated backwards from that exact date.
+
 ---
