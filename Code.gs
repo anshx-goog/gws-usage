@@ -55,7 +55,16 @@ const REPORT_CONFIG = {
   REPORT_TIMEZONE: 'America/Los_Angeles', // Admin SDK Reports API uses PST boundaries
   MAX_LOOKBACK_DAYS_FOR_REPORT_DATE: 10,
   INITIAL_LAG_DAYS: 2,
-  MAX_AUDIT_PAGES_PER_APP: 60, // Up to 60,000 events per app with maxResults=1000
+  MAX_AUDIT_PAGES_PER_APP: 25, // Memory-safe page cap (up to 25,000 events per app with maxResults=1000)
+  MAX_AUDIT_PAGES_BY_APP: {
+    meet: 35,
+    drive: 20,
+    calendar: 20,
+    contacts: 15,
+    token: 15,
+    chat: 10,
+    login: 5
+  },
   AUDIT_MAX_RESULTS: 1000,
   USER_USAGE_MAX_RESULTS: 1000,
   DIRECTORY_USERS_MAX_RESULTS: 500,
@@ -64,7 +73,8 @@ const REPORT_CONFIG = {
   SHEET_NAMES: {
     SCORECARD: 'Adoption Scorecard',
     DOMAIN_BREAKDOWN: 'Multi-Domain Breakdown',
-    METHODOLOGY: 'Data Sources & Audit Log'
+    METHODOLOGY: 'Data Sources & Audit Log',
+    MEET_DEEP_DIVE: 'Meet Usage Deep-Dive'
   },
   COLORS: {
     GOOGLE_BLUE: '#4285F4',
@@ -195,24 +205,66 @@ const WORKSPACE_PRODUCTS = [
 ];
 
 /**
+ * Compact bitmask flags for per-user product activity deduplication.
+ * Eliminates large in-memory Set allocations per user/domain.
+ */
+const PRODUCT_BITS = {
+  GMAIL: 1 << 0,      // 1
+  CALENDAR: 1 << 1,   // 2
+  DRIVE: 1 << 2,      // 4
+  DOCS: 1 << 3,       // 8
+  SHEETS: 1 << 4,     // 16
+  SLIDES: 1 << 5,     // 32
+  CHAT: 1 << 6,       // 64
+  MEET: 1 << 7,       // 128
+  CONTACTS: 1 << 8    // 256
+};
+const WORKSPACE_ACTIVE_BIT = 1 << 9; // 512
+
+/**
  * Adds a custom menu when the Google Sheet is opened.
  */
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
   ui.createMenu('🏢 Workspace Usage Report')
-    .addItem('▶️ Generate Full Organization & Multi-Domain Report', 'generateWorkspaceUsageReport')
-    .addItem('🌐 Generate Individual Scorecard Tabs Per Domain', 'generateWorkspaceUsageReportWithDomainTabs')
+    .addItem('▶️ Generate Core Workspace Usage Report (Fast Overview)', 'generateWorkspaceUsageReport')
+    .addItem('📹 Generate Granular Meet Usage Report', 'generateGranularMeetUsageReport')
     .addSeparator()
-    .addItem('🧪 Generate Sample Report (writercorporation.com Demo)', 'generateSampleScorecardReport')
+    .addItem('🔄 Generate Complete Report (Core Services + Granular Meet)', 'generateCompleteWorkspaceUsageReport')
+    .addItem('🌐 Generate Individual Scorecard Tabs Per Domain', 'generateWorkspaceUsageReportWithDomainTabs')
     .addToUi();
 }
 
 /**
- * Main entry point for Super Admins: retrieves usage across ALL domains in the
- * Google Workspace organization and renders the formatted sheets.
+ * Main entry point for Super Admins: retrieves core usage across ALL domains in the
+ * Google Workspace organization and renders the executive Adoption Scorecard & Breakdown.
+ * Skips the heavy 28-day daily Meet rollup and conference audit loops for maximum speed.
  */
 function generateWorkspaceUsageReport() {
-  return runWorkspaceUsageReport_({ createPerDomainScorecardTabs: false });
+  return runWorkspaceUsageReport_({
+    createPerDomainScorecardTabs: false,
+    includeMeetGranularAudit: false
+  });
+}
+
+/**
+ * Dedicated entry point for deep-dive Google Meet telemetry:
+ * Analyzes 28-day conference audit logs, screen sharing, recording, livestreams,
+ * large meetings (>100 participants), and multi-domain conference metrics.
+ * Renders the dedicated 'Meet Usage Deep-Dive' sheet and updates existing scorecard cards.
+ */
+function generateGranularMeetUsageReport() {
+  return runGranularMeetReport_();
+}
+
+/**
+ * Generates the complete report including core service overview AND granular Meet conference telemetry in a single run.
+ */
+function generateCompleteWorkspaceUsageReport() {
+  return runWorkspaceUsageReport_({
+    createPerDomainScorecardTabs: false,
+    includeMeetGranularAudit: true
+  });
 }
 
 /**
@@ -220,15 +272,21 @@ function generateWorkspaceUsageReport() {
  * individual domain in the organization.
  */
 function generateWorkspaceUsageReportWithDomainTabs() {
-  return runWorkspaceUsageReport_({ createPerDomainScorecardTabs: true });
+  return runWorkspaceUsageReport_({
+    createPerDomainScorecardTabs: true,
+    includeMeetGranularAudit: false
+  });
 }
 
 /**
  * Core orchestrator for fetching, reconciling, and rendering the report.
- * @param {{createPerDomainScorecardTabs: boolean}} options
+ * @param {{createPerDomainScorecardTabs: boolean, includeMeetGranularAudit: boolean}} options
  */
 function runWorkspaceUsageReport_(options) {
-  const opts = options || { createPerDomainScorecardTabs: false };
+  const opts = options || {
+    createPerDomainScorecardTabs: false,
+    includeMeetGranularAudit: false
+  };
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   toast_(ss, 'Step 1/6: Discovering organization customer ID and all registered domains...', 'Workspace Usage Report');
 
@@ -243,9 +301,9 @@ function runWorkspaceUsageReport_(options) {
   toast_(ss, 'Step 3/6: Listing users across all domains via Admin Directory API...', 'Workspace Usage Report');
   const directoryData = fetchUserAndLicenseInventory_(orgInfo, windowInfo);
 
-  // 4. Fetch CustomerUsageReports (latest snapshot + 28-day daily Meet rollup)
-  toast_(ss, 'Step 4/6: Fetching Customer Usage Reports & 28-day daily Meet metrics...', 'Workspace Usage Report');
-  const customerUsage = fetchCustomerUsageMetrics_(windowInfo, orgInfo, directoryData);
+  // 4. Fetch CustomerUsageReports (latest snapshot + optional 28-day daily Meet rollup)
+  toast_(ss, 'Step 4/6: Fetching Customer Usage Reports & product metrics...', 'Workspace Usage Report');
+  const customerUsage = fetchCustomerUsageMetrics_(windowInfo, orgInfo, directoryData, opts);
 
   // 5. Fetch per-user usage report & 28-day Activity Audit logs across apps
   toast_(ss, 'Step 5/6: Fetching User Usage & 28-day Activity Audit logs across all products...', 'Workspace Usage Report');
@@ -253,7 +311,8 @@ function runWorkspaceUsageReport_(options) {
     windowInfo,
     orgInfo,
     directoryData,
-    customerUsage
+    customerUsage,
+    opts
   );
 
   // 6. Reconcile organization-wide and per-domain numbers & percentages
@@ -530,8 +589,9 @@ function findLatestAvailableReportDate_() {
  * from ALL domains (primary, secondary, subdomains) are retrieved.
  */
 function fetchUserAndLicenseInventory_(orgInfo, windowInfo) {
-  const usersByEmail = new Map();
   const domainStatsMap = new Map();
+  const userMaskMap = new Map();
+  let totalUsersCount = 0;
 
   // Initialize domain stats for all discovered domains
   orgInfo.domainsMap.forEach((domainMeta, domainName) => {
@@ -539,12 +599,18 @@ function fetchUserAndLicenseInventory_(orgInfo, windowInfo) {
   });
 
   let pageToken = null;
+  let useFields = true;
+
   do {
     const listArgs = {
       customer: orgInfo.customerId || 'my_customer',
       maxResults: REPORT_CONFIG.DIRECTORY_USERS_MAX_RESULTS,
       showDeleted: 'false'
     };
+    if (useFields) {
+      listArgs.projection = 'BASIC';
+      listArgs.fields = 'nextPageToken,users(primaryEmail,suspended,archived,lastLoginTime,aliases)';
+    }
     if (pageToken) {
       listArgs.pageToken = pageToken;
     }
@@ -553,8 +619,22 @@ function fetchUserAndLicenseInventory_(orgInfo, windowInfo) {
     try {
       resp = executeWithRetry_(() => AdminDirectory.Users.list(listArgs));
     } catch (e) {
-      // Fallback to 'my_customer' if explicit customerId failed
-      if (listArgs.customer !== 'my_customer') {
+      if (useFields && !pageToken) {
+        // Fallback: retry without partial fields projection
+        useFields = false;
+        delete listArgs.projection;
+        delete listArgs.fields;
+        try {
+          resp = executeWithRetry_(() => AdminDirectory.Users.list(listArgs));
+        } catch (innerE) {
+          if (listArgs.customer !== 'my_customer') {
+            listArgs.customer = 'my_customer';
+            resp = executeWithRetry_(() => AdminDirectory.Users.list(listArgs));
+          } else {
+            throw innerE;
+          }
+        }
+      } else if (listArgs.customer !== 'my_customer') {
         listArgs.customer = 'my_customer';
         resp = executeWithRetry_(() => AdminDirectory.Users.list(listArgs));
       } else {
@@ -563,11 +643,17 @@ function fetchUserAndLicenseInventory_(orgInfo, windowInfo) {
     }
 
     const users = (resp && resp.users) || [];
-    users.forEach((u) => {
+    for (let uIdx = 0; uIdx < users.length; uIdx++) {
+      const u = users[uIdx];
       const email = (u.primaryEmail || '').toLowerCase().trim();
-      if (!email || !email.includes('@')) return;
+      if (!email || !email.includes('@')) continue;
 
-      const domain = email.split('@')[1];
+      totalUsersCount++;
+      let domain = email.split('@')[1];
+      if (orgInfo.aliasToParentDomain && orgInfo.aliasToParentDomain.has(domain)) {
+        domain = orgInfo.aliasToParentDomain.get(domain);
+      }
+
       if (!domainStatsMap.has(domain)) {
         const discoveredMeta = {
           domainName: domain,
@@ -583,31 +669,13 @@ function fetchUserAndLicenseInventory_(orgInfo, windowInfo) {
 
       const isSuspended = Boolean(u.suspended);
       const isArchived = Boolean(u.archived);
-      const isActiveAccount = !isSuspended && !isArchived;
       const lastLoginMs = parseTimestampToMs_(u.lastLoginTime);
       const loggedIn28d =
         lastLoginMs !== null &&
         lastLoginMs >= windowInfo.windowStartMs &&
         lastLoginMs <= windowInfo.windowEndMs;
 
-      const userRecord = {
-        email: email,
-        id: u.id || '',
-        domain: domain,
-        suspended: isSuspended,
-        archived: isArchived,
-        isActiveAccount: isActiveAccount,
-        isAdmin: Boolean(u.isAdmin),
-        isDelegatedAdmin: Boolean(u.isDelegatedAdmin),
-        lastLoginMs: lastLoginMs,
-        loggedIn28d: loggedIn28d,
-        activeProducts28d: new Set(),
-        storageUsedMb: 0
-      };
-
-      usersByEmail.set(email, userRecord);
-
-      // Accumulate domain-level user counts
+      // Accumulate domain-level user counts directly
       const dStats = domainStatsMap.get(domain);
       dStats.totalUsers++;
       if (isSuspended) {
@@ -618,11 +686,12 @@ function fetchUserAndLicenseInventory_(orgInfo, windowInfo) {
         dStats.activeProvisionedUsers++;
       }
       if (loggedIn28d) {
-        dStats.activeWorkspaceUsersSet.add(email);
+        userMaskMap.set(email, WORKSPACE_ACTIVE_BIT);
+        dStats.directWorkspaceActiveCount++;
       }
 
       // Map user aliases as well so audit events using an alias resolve to primaryEmail
-      if (Array.isArray(u.aliases)) {
+      if (Array.isArray(u.aliases) && u.aliases.length > 0) {
         u.aliases.forEach((aliasEmail) => {
           const normAlias = (aliasEmail || '').toLowerCase().trim();
           if (normAlias) {
@@ -630,24 +699,46 @@ function fetchUserAndLicenseInventory_(orgInfo, windowInfo) {
           }
         });
       }
-    });
+    }
 
     pageToken = resp ? resp.nextPageToken : null;
   } while (pageToken);
 
   return {
-    usersByEmail: usersByEmail,
-    domainStatsMap: domainStatsMap
+    totalUsers: totalUsersCount,
+    domainStatsMap: domainStatsMap,
+    userMaskMap: userMaskMap,
+    usersByEmail: {
+      get size() {
+        return totalUsersCount;
+      },
+      has: function(email) {
+        if (!email || !email.includes('@')) return false;
+        let dom = email.split('@')[1];
+        if (orgInfo.aliasToParentDomain && orgInfo.aliasToParentDomain.has(dom)) {
+          dom = orgInfo.aliasToParentDomain.get(dom);
+        }
+        return domainStatsMap.has(dom);
+      }
+    }
   };
 }
 
 /**
- * Creates an empty per-domain aggregation record.
+ * Creates an empty per-domain aggregation record with lightweight numeric counters
+ * and memory-safe backward compatibility proxies.
  */
 function createEmptyDomainStats_(domainName, domainMeta) {
-  const productSets = {};
+  const productCounts = {};
+  const productProxy = {};
   WORKSPACE_PRODUCTS.forEach((p) => {
-    productSets[p.key] = new Set();
+    productCounts[p.key] = 0;
+    productProxy[p.key] = {
+      get size() {
+        return productCounts[p.key] || 0;
+      },
+      add: function() {}
+    };
   });
   return {
     domainName: domainName,
@@ -663,10 +754,21 @@ function createEmptyDomainStats_(domainName, domainMeta) {
     suspendedUsers: 0,
     archivedUsers: 0,
     storageUsedMb: 0,
-    activeWorkspaceUsersSet: new Set(),
-    productActiveUsersSets: productSets,
+    directWorkspaceActiveCount: 0,
+    productCounts: productCounts,
     aliasEmailToPrimary: new Map(),
-    meetConferencesMap: new Map() // conference_id -> conference summary organized by this domain
+    meetConferencesMap: new Map(),
+    meetSummary: null,
+    get activeWorkspaceUsersSet() {
+      const self = this;
+      return {
+        get size() {
+          return self.directWorkspaceActiveCount;
+        },
+        add: function() {}
+      };
+    },
+    productActiveUsersSets: productProxy
   };
 }
 
@@ -677,7 +779,7 @@ function createEmptyDomainStats_(domainName, domainMeta) {
  * Extracts organization-wide license counts, product active user counts, and
  * 28-day daily Google Meet call/meeting totals from CustomerUsageReports.
  */
-function fetchCustomerUsageMetrics_(windowInfo, orgInfo, directoryData) {
+function fetchCustomerUsageMetrics_(windowInfo, orgInfo, directoryData, options) {
   const params = windowInfo.initialCustomerParams || {};
 
   // 4A. Calculate total purchased & assigned licenses from CustomerUsageReports
@@ -748,10 +850,28 @@ function fetchCustomerUsageMetrics_(windowInfo, orgInfo, directoryData) {
   // 4B. Extract 1-day, 7-day, 28-day, and 30-day active user counters per product
   const productCustomerCounts = {};
   WORKSPACE_PRODUCTS.forEach((p) => {
-    const count1d = p.customerParam1d ? toInt_(params[p.customerParam1d]) : 0;
-    const count7d = p.customerParam7d ? toInt_(params[p.customerParam7d]) : 0;
-    const count30d = p.customerParam30d ? toInt_(params[p.customerParam30d]) : 0;
-    const count28dNative = p.customerParam28d ? toInt_(params[p.customerParam28d]) : null;
+    let count1d = p.customerParam1d ? toInt_(params[p.customerParam1d]) : 0;
+    let count7d = p.customerParam7d ? toInt_(params[p.customerParam7d]) : 0;
+    let count30d = p.customerParam30d ? toInt_(params[p.customerParam30d]) : 0;
+    let count28dNative = p.customerParam28d ? toInt_(params[p.customerParam28d]) : null;
+
+    // Resilient fallback check for Google Meet parameter variations across API versions
+    if (p.key === 'MEET') {
+      if (count30d === 0) {
+        count30d = toInt_(params['meet:num_30day_active_users']) ||
+                   toInt_(params['meet:num_30day_users']) ||
+                   toInt_(params['meet:num_active_users']) ||
+                   toInt_(params['meet:num_users']) || 0;
+      }
+      if (count7d === 0) {
+        count7d = toInt_(params['meet:num_7day_active_users']) ||
+                  toInt_(params['meet:num_7day_users']) || 0;
+      }
+      if (count1d === 0) {
+        count1d = toInt_(params['meet:num_1day_active_users']) ||
+                  toInt_(params['meet:num_1day_users']) || 0;
+      }
+    }
 
     // When a product reports 7-day and 30-day rolling active users in CustomerUsageReports
     // (e.g., Gmail, Calendar, Drive, Docs, Sheets, Slides, Meet), interpolate the 28-day
@@ -787,7 +907,25 @@ function fetchCustomerUsageMetrics_(windowInfo, orgInfo, directoryData) {
       : logins30d;
 
   // 4C. Aggregate daily Meet metrics from CustomerUsageReports across the 28-day window
-  const dailyMeetRollup = fetch28DayDailyMeetCustomerUsage_(windowInfo);
+  let dailyMeetRollup = null;
+  if (options && options.includeMeetGranularAudit) {
+    dailyMeetRollup = fetch28DayDailyMeetCustomerUsage_(windowInfo);
+  } else {
+    // Fast path: extract baseline totals directly from initialCustomerParams without 28 daily API calls
+    const snapshotMeetings = toInt_(params['meet:num_meetings']);
+    const snapshotTotalMins = toInt_(params['meet:total_meeting_minutes']);
+    const snapshotAvgMins = toInt_(params['meet:average_meeting_minutes']);
+    const snapshotCalls = toInt_(params['meet:num_calls']);
+    const snapshotCallMins = toInt_(params['meet:total_call_minutes']);
+    dailyMeetRollup = {
+      totalMeetings28d: snapshotMeetings,
+      totalMeetingMinutes28d: snapshotTotalMins,
+      avgMeetingMinutes28d: snapshotAvgMins,
+      totalCalls28d: snapshotCalls,
+      totalCallMinutes28d: snapshotCallMins,
+      isBaselineOnly: true
+    };
+  }
 
   return {
     rawParams: params,
@@ -913,11 +1051,117 @@ function fetch28DayDailyMeetCustomerUsage_(windowInfo) {
  *    - `contacts` & `token` (tracks active Contacts users per domain)
  *    - `login` (supplements Workspace login activity)
  */
+/**
+ * Fast, memory-efficient bitmask updater for a user's active products.
+ * Updates numeric productCounts on domainStats directly with zero Set allocations.
+ */
+function markUserProductActiveFast_(
+  email,
+  rawDomain,
+  productKey,
+  userMaskMap,
+  domainStatsMap,
+  orgInfo
+) {
+  if (!email || !email.includes('@')) return;
+  const bit = PRODUCT_BITS[productKey];
+  if (!bit) return;
+
+  let domain = rawDomain || email.split('@')[1];
+  if (orgInfo && orgInfo.aliasToParentDomain && orgInfo.aliasToParentDomain.has(domain)) {
+    domain = orgInfo.aliasToParentDomain.get(domain);
+  }
+
+  let dStats = domainStatsMap ? domainStatsMap.get(domain) : null;
+  if (!dStats && domainStatsMap) {
+    if (orgInfo) {
+      const meta = (orgInfo.domainsMap && orgInfo.domainsMap.get(domain)) || {
+        domainName: domain,
+        isPrimary: domain === orgInfo.primaryDomain,
+        verified: true,
+        domainType: domain === orgInfo.primaryDomain ? 'Primary Domain' : 'Secondary Domain',
+        aliases: []
+      };
+      if (orgInfo.domainsMap) orgInfo.domainsMap.set(domain, meta);
+      dStats = createEmptyDomainStats_(domain, meta);
+      domainStatsMap.set(domain, dStats);
+    } else {
+      return;
+    }
+  }
+
+  const currentMask = userMaskMap ? userMaskMap.get(email) || 0 : 0;
+  let newMask = currentMask;
+
+  if ((currentMask & bit) === 0) {
+    newMask |= bit;
+    if (dStats) {
+      dStats.productCounts[productKey] = (dStats.productCounts[productKey] || 0) + 1;
+    }
+  }
+  if ((currentMask & WORKSPACE_ACTIVE_BIT) === 0) {
+    newMask |= WORKSPACE_ACTIVE_BIT;
+    if (dStats) {
+      dStats.directWorkspaceActiveCount = (dStats.directWorkspaceActiveCount || 0) + 1;
+    }
+  }
+
+  if (userMaskMap && newMask !== currentMask) {
+    userMaskMap.set(email, newMask);
+  }
+}
+
+/**
+ * Fast, memory-efficient bitmask updater for workspace active status.
+ */
+function markUserActiveInWorkspaceFast_(
+  email,
+  rawDomain,
+  userMaskMap,
+  domainStatsMap,
+  orgInfo
+) {
+  if (!email || !email.includes('@')) return;
+  let domain = rawDomain || email.split('@')[1];
+  if (orgInfo && orgInfo.aliasToParentDomain && orgInfo.aliasToParentDomain.has(domain)) {
+    domain = orgInfo.aliasToParentDomain.get(domain);
+  }
+
+  let dStats = domainStatsMap ? domainStatsMap.get(domain) : null;
+  if (!dStats && domainStatsMap) {
+    if (orgInfo) {
+      const meta = (orgInfo.domainsMap && orgInfo.domainsMap.get(domain)) || {
+        domainName: domain,
+        isPrimary: domain === orgInfo.primaryDomain,
+        verified: true,
+        domainType: domain === orgInfo.primaryDomain ? 'Primary Domain' : 'Secondary Domain',
+        aliases: []
+      };
+      if (orgInfo.domainsMap) orgInfo.domainsMap.set(domain, meta);
+      dStats = createEmptyDomainStats_(domain, meta);
+      domainStatsMap.set(domain, dStats);
+    } else {
+      return;
+    }
+  }
+
+  const currentMask = userMaskMap ? userMaskMap.get(email) || 0 : 0;
+  if ((currentMask & WORKSPACE_ACTIVE_BIT) === 0) {
+    if (userMaskMap) {
+      userMaskMap.set(email, currentMask | WORKSPACE_ACTIVE_BIT);
+    }
+    if (dStats) {
+      dStats.directWorkspaceActiveCount = (dStats.directWorkspaceActiveCount || 0) + 1;
+    }
+  }
+}
+
 function fetchUserAndActivityAuditMetrics_(
   windowInfo,
   orgInfo,
   directoryData,
-  customerUsage
+  customerUsage,
+  options
 ) {
   const userUsageParams = [
     'accounts:domain_name',
@@ -954,16 +1198,24 @@ function fetchUserAndActivityAuditMetrics_(
     'chat:num_28day_spaces_created'
   ].join(',');
 
-  // 5A. Process UserUsageReport for all users on reportDateStr
+  const userMaskMap = directoryData.userMaskMap;
+  const domainStatsMap = directoryData.domainStatsMap;
+
+  // 5A. Process UserUsageReport for all users on reportDateStr using stream processing
   let pageToken = null;
   let userReportRowsProcessed = 0;
   let useExplicitParams = true;
+  let useFields = true;
+
   do {
     const reqArgs = {
       maxResults: REPORT_CONFIG.USER_USAGE_MAX_RESULTS
     };
     if (useExplicitParams) {
       reqArgs.parameters = userUsageParams;
+    }
+    if (useFields) {
+      reqArgs.fields = 'nextPageToken,usageReports(entity/userEmail,parameters)';
     }
     if (pageToken) {
       reqArgs.pageToken = pageToken;
@@ -975,8 +1227,31 @@ function fetchUserAndActivityAuditMetrics_(
         AdminReports.UserUsageReport.get('all', windowInfo.reportDateStr, reqArgs)
       );
     } catch (e) {
-      if (useExplicitParams && !pageToken) {
-        // Fallback: omit `parameters` to request all available UserUsageReport parameters
+      if (useFields && !pageToken) {
+        useFields = false;
+        delete reqArgs.fields;
+        try {
+          resp = executeWithRetry_(() =>
+            AdminReports.UserUsageReport.get('all', windowInfo.reportDateStr, reqArgs)
+          );
+        } catch (fErr) {
+          if (useExplicitParams) {
+            useExplicitParams = false;
+            delete reqArgs.parameters;
+            try {
+              resp = executeWithRetry_(() =>
+                AdminReports.UserUsageReport.get('all', windowInfo.reportDateStr, reqArgs)
+              );
+            } catch (innerErr) {
+              Logger.log('UserUsageReport.get warning: ' + innerErr.message);
+              break;
+            }
+          } else {
+            Logger.log('UserUsageReport.get warning: ' + fErr.message);
+            break;
+          }
+        }
+      } else if (useExplicitParams && !pageToken) {
         useExplicitParams = false;
         delete reqArgs.parameters;
         try {
@@ -994,119 +1269,149 @@ function fetchUserAndActivityAuditMetrics_(
     }
 
     const reports = (resp && resp.usageReports) || [];
-    reports.forEach((r) => {
+    for (let rIdx = 0; rIdx < reports.length; rIdx++) {
+      const r = reports[rIdx];
       userReportRowsProcessed++;
       const rawEmail = (r.entity && r.entity.userEmail) || '';
       const email = resolveUserEmail_(rawEmail, orgInfo, directoryData);
-      if (!email || !email.includes('@')) return;
+      if (!email || !email.includes('@')) continue;
 
-      const pMap = parseReportParametersList_(r.parameters || []);
-      const userRec = getOrCreateUserRecord_(email, pMap, orgInfo, directoryData);
-      const dStats = directoryData.domainStatsMap.get(userRec.domain);
+      let domain = email.split('@')[1];
+      if (orgInfo.aliasToParentDomain && orgInfo.aliasToParentDomain.has(domain)) {
+        domain = orgInfo.aliasToParentDomain.get(domain);
+      }
+      let dStats = domainStatsMap.get(domain);
+      if (!dStats) {
+        const meta = (orgInfo.domainsMap && orgInfo.domainsMap.get(domain)) || {
+          domainName: domain,
+          isPrimary: domain === orgInfo.primaryDomain,
+          verified: true,
+          domainType: domain === orgInfo.primaryDomain ? 'Primary Domain' : 'Secondary Domain',
+          aliases: []
+        };
+        orgInfo.domainsMap.set(domain, meta);
+        dStats = createEmptyDomainStats_(domain, meta);
+        domainStatsMap.set(domain, dStats);
+      }
 
-      // Storage quota
-      const userQuotaMb =
-        toInt_(pMap['accounts:used_quota_in_mb']) ||
-        toInt_(pMap['accounts:drive_used_quota_in_mb']) +
-          toInt_(pMap['accounts:gmail_used_quota_in_mb']);
+      const pList = r.parameters || [];
+      let userQuotaMb = 0;
+      let loginActive28d = false;
+      let gmailActive28d = false;
+      let driveActive28d = false;
+      let docsActive28d = false;
+      let sheetsActive28d = false;
+      let slidesActive28d = false;
+      let chatActive28d = false;
+
+      for (let pIdx = 0; pIdx < pList.length; pIdx++) {
+        const p = pList[pIdx];
+        const pName = p.name;
+        if (!pName) continue;
+
+        if (pName === 'accounts:used_quota_in_mb') {
+          userQuotaMb = Number(p.intValue || 0);
+        } else if (pName === 'accounts:drive_used_quota_in_mb' || pName === 'accounts:gmail_used_quota_in_mb') {
+          userQuotaMb += Number(p.intValue || 0);
+        } else if (
+          pName === 'accounts:timestamp_last_login' ||
+          pName === 'accounts:last_login_time' ||
+          pName === 'accounts:timestamp_last_sso' ||
+          pName === 'accounts:last_sso_time'
+        ) {
+          if (!loginActive28d && isTimestampInWindow_(p.datetimeValue || p.stringValue || p.intValue, windowInfo)) {
+            loginActive28d = true;
+          }
+        } else if (
+          pName === 'gmail:timestamp_last_interaction' ||
+          pName === 'gmail:last_interaction_time' ||
+          pName === 'gmail:timestamp_last_webmail' ||
+          pName === 'gmail:last_webmail_time' ||
+          pName === 'gmail:timestamp_last_imap' ||
+          pName === 'gmail:last_imap_time' ||
+          pName === 'gmail:timestamp_last_pop' ||
+          pName === 'gmail:last_pop_time'
+        ) {
+          if (!gmailActive28d && isTimestampInWindow_(p.datetimeValue || p.stringValue || p.intValue, windowInfo)) {
+            gmailActive28d = true;
+          }
+        } else if (pName === 'gmail:num_emails_sent') {
+          if (!gmailActive28d && Number(p.intValue || 0) > 0) {
+            gmailActive28d = true;
+          }
+        } else if (pName === 'drive:timestamp_last_active_usage') {
+          if (!driveActive28d && isTimestampInWindow_(p.datetimeValue || p.stringValue || p.intValue, windowInfo)) {
+            driveActive28d = true;
+          }
+        } else if (pName === 'drive:num_items_viewed' || pName === 'drive:num_items_edited' || pName === 'drive:num_items_created') {
+          if (!driveActive28d && Number(p.intValue || 0) > 0) {
+            driveActive28d = true;
+          }
+        } else if (pName === 'drive:num_google_documents_viewed' || pName === 'drive:num_google_documents_edited' || pName === 'drive:num_google_documents_created') {
+          if (Number(p.intValue || 0) > 0) {
+            docsActive28d = true;
+            driveActive28d = true;
+          }
+        } else if (pName === 'drive:num_google_spreadsheets_viewed' || pName === 'drive:num_google_spreadsheets_edited' || pName === 'drive:num_google_spreadsheets_created') {
+          if (Number(p.intValue || 0) > 0) {
+            sheetsActive28d = true;
+            driveActive28d = true;
+          }
+        } else if (pName === 'drive:num_google_presentations_viewed' || pName === 'drive:num_google_presentations_edited' || pName === 'drive:num_google_presentations_created') {
+          if (Number(p.intValue || 0) > 0) {
+            slidesActive28d = true;
+            driveActive28d = true;
+          }
+        } else if (pName.startsWith('chat:num_28day_')) {
+          if (!chatActive28d && Number(p.intValue || 0) > 0) {
+            chatActive28d = true;
+          }
+        }
+      }
+
       if (userQuotaMb > 0) {
-        userRec.storageUsedMb = userQuotaMb;
         dStats.storageUsedMb += userQuotaMb;
       }
-
-      // Login activity in 28d window (supports both timestamp_last_* and legacy last_*_time)
-      if (
-        isTimestampInWindow_(pMap['accounts:timestamp_last_login'], windowInfo) ||
-        isTimestampInWindow_(pMap['accounts:last_login_time'], windowInfo) ||
-        isTimestampInWindow_(pMap['accounts:timestamp_last_sso'], windowInfo) ||
-        isTimestampInWindow_(pMap['accounts:last_sso_time'], windowInfo)
-      ) {
-        markUserActiveInWorkspace_(userRec, dStats);
+      if (loginActive28d) {
+        markUserActiveInWorkspaceFast_(email, domain, userMaskMap, domainStatsMap, orgInfo);
       }
-
-      // 1. GMAIL 28-day activity
-      const gmailActive28d =
-        isTimestampInWindow_(pMap['gmail:timestamp_last_interaction'], windowInfo) ||
-        isTimestampInWindow_(pMap['gmail:last_interaction_time'], windowInfo) ||
-        isTimestampInWindow_(pMap['gmail:timestamp_last_webmail'], windowInfo) ||
-        isTimestampInWindow_(pMap['gmail:last_webmail_time'], windowInfo) ||
-        isTimestampInWindow_(pMap['gmail:timestamp_last_imap'], windowInfo) ||
-        isTimestampInWindow_(pMap['gmail:last_imap_time'], windowInfo) ||
-        isTimestampInWindow_(pMap['gmail:timestamp_last_pop'], windowInfo) ||
-        isTimestampInWindow_(pMap['gmail:last_pop_time'], windowInfo) ||
-        toInt_(pMap['gmail:num_emails_sent']) > 0;
       if (gmailActive28d) {
-        markUserProductActive_(userRec, dStats, 'GMAIL');
+        markUserProductActiveFast_(email, domain, 'GMAIL', userMaskMap, domainStatsMap, orgInfo);
       }
-
-      // 2. DRIVE 28-day activity
-      const driveItemsDay =
-        toInt_(pMap['drive:num_items_viewed']) +
-        toInt_(pMap['drive:num_items_edited']) +
-        toInt_(pMap['drive:num_items_created']);
-      const driveActive28d =
-        isTimestampInWindow_(pMap['drive:timestamp_last_active_usage'], windowInfo) ||
-        driveItemsDay > 0;
       if (driveActive28d) {
-        markUserProductActive_(userRec, dStats, 'DRIVE');
+        markUserProductActiveFast_(email, domain, 'DRIVE', userMaskMap, domainStatsMap, orgInfo);
       }
-
-      // 3. DOCS / SHEETS / SLIDES activity from UserUsageReport
-      const docsDay =
-        toInt_(pMap['drive:num_google_documents_viewed']) +
-        toInt_(pMap['drive:num_google_documents_edited']) +
-        toInt_(pMap['drive:num_google_documents_created']);
-      if (docsDay > 0) {
-        markUserProductActive_(userRec, dStats, 'DOCS');
-        markUserProductActive_(userRec, dStats, 'DRIVE');
+      if (docsActive28d) {
+        markUserProductActiveFast_(email, domain, 'DOCS', userMaskMap, domainStatsMap, orgInfo);
       }
-
-      const sheetsDay =
-        toInt_(pMap['drive:num_google_spreadsheets_viewed']) +
-        toInt_(pMap['drive:num_google_spreadsheets_edited']) +
-        toInt_(pMap['drive:num_google_spreadsheets_created']);
-      if (sheetsDay > 0) {
-        markUserProductActive_(userRec, dStats, 'SHEETS');
-        markUserProductActive_(userRec, dStats, 'DRIVE');
+      if (sheetsActive28d) {
+        markUserProductActiveFast_(email, domain, 'SHEETS', userMaskMap, domainStatsMap, orgInfo);
       }
-
-      const slidesDay =
-        toInt_(pMap['drive:num_google_presentations_viewed']) +
-        toInt_(pMap['drive:num_google_presentations_edited']) +
-        toInt_(pMap['drive:num_google_presentations_created']);
-      if (slidesDay > 0) {
-        markUserProductActive_(userRec, dStats, 'SLIDES');
-        markUserProductActive_(userRec, dStats, 'DRIVE');
+      if (slidesActive28d) {
+        markUserProductActiveFast_(email, domain, 'SLIDES', userMaskMap, domainStatsMap, orgInfo);
       }
-
-      // 4. CHAT 28-day native user counters
-      const chat28dTotal =
-        toInt_(pMap['chat:num_28day_conversations_read']) +
-        toInt_(pMap['chat:num_28day_messages_and_reactions_sent']) +
-        toInt_(pMap['chat:num_28day_attachments_uploaded']) +
-        toInt_(pMap['chat:num_28day_spaces_created']);
-      if (chat28dTotal > 0) {
-        markUserProductActive_(userRec, dStats, 'CHAT');
+      if (chatActive28d) {
+        markUserProductActiveFast_(email, domain, 'CHAT', userMaskMap, domainStatsMap, orgInfo);
       }
-    });
+    }
 
     pageToken = resp ? resp.nextPageToken : null;
   } while (pageToken);
 
-  // 5B. Process 28-Day Activity Audit Logs across applications
+  // 5B. Process 28-Day Activity Audit Logs across applications using memory-safe partial fields
   const auditStats = {
     userReportRowsProcessed: userReportRowsProcessed,
     eventsProcessedByApp: {}
   };
 
-  // Drive Audit Events (for 28-day Docs, Sheets, Slides, and Drive active users per domain)
+  // Drive Audit Events (distinguishes doc_type == document | spreadsheet | presentation)
   auditStats.eventsProcessedByApp.drive = processDriveActivityAudit28d_(
     windowInfo,
     orgInfo,
     directoryData
   );
 
-  // Calendar Audit Events (for 28-day Calendar active users per domain)
+  // Calendar Audit Events (tracks active Calendar users per domain)
   auditStats.eventsProcessedByApp.calendar = processSimpleAppActivityAudit28d_(
     'calendar',
     'CALENDAR',
@@ -1115,15 +1420,57 @@ function fetchUserAndActivityAuditMetrics_(
     directoryData
   );
 
-  // Meet Audit Events (for 28-day Meet active users per domain + all 6 Meet Usage Scorecard metrics)
-  const meetAuditResult = processMeetActivityAudit28d_(
-    windowInfo,
-    orgInfo,
-    directoryData
-  );
-  auditStats.eventsProcessedByApp.meet = meetAuditResult.eventsProcessed;
+  // Meet Audit Events (active Meet users per domain + 6 Meet Usage metrics)
+  let meetAuditResult = null;
+  if (options && options.includeMeetGranularAudit) {
+    meetAuditResult = processMeetActivityAudit28d_(
+      windowInfo,
+      orgInfo,
+      directoryData,
+      customerUsage
+    );
+    auditStats.eventsProcessedByApp.meet = meetAuditResult.eventsProcessed;
+  } else {
+    // Fast path: Stream Meet activity audit solely for active human user adoption
+    // (marking internal users active in MEET across domains), skipping conference
+    // geometry, duration math, screen sharing / recording / livestream aggregation,
+    // and the 28-day daily API loops.
+    const meetEvents = processMeetActiveUsersAudit28d_(
+      windowInfo,
+      orgInfo,
+      directoryData
+    );
+    auditStats.eventsProcessedByApp.meet = meetEvents;
+    const dailyRollup = customerUsage ? customerUsage.dailyMeetRollup : null;
+    const emptyAgg = createEmptyMeetAuditAgg_();
+    const orgMeetMetrics = finalizeMeetSummaryFromAgg_(emptyAgg, dailyRollup);
+    orgMeetMetrics.isGranular = false;
+    const domainMeetMetricsMap = new Map();
+    directoryData.domainStatsMap.forEach((_, dom) => {
+      domainMeetMetricsMap.set(dom, {
+        hasData: orgMeetMetrics.hasData,
+        isGranular: false,
+        numMeetings: 0,
+        avgMeetingTimeMinutes: 0,
+        totalMeetingMinutes: 0,
+        numScreencastMeetings: 0,
+        pctScreencastMeetings: 0,
+        numRecordedMeetings: 0,
+        pctRecordedMeetings: 0,
+        numLiveStreamMeetings: 0,
+        pctLiveStreamMeetings: 0,
+        numOver100Meetings: 0,
+        pctOver100Meetings: 0
+      });
+    });
+    meetAuditResult = {
+      eventsProcessed: meetEvents,
+      orgMeetMetrics: orgMeetMetrics,
+      domainMeetMetricsMap: domainMeetMetricsMap
+    };
+  }
 
-  // Chat Audit Events (supplements 28-day Chat active users per domain)
+  // Chat Audit Events (supplements per-user Chat activity)
   auditStats.eventsProcessedByApp.chat = processSimpleAppActivityAudit28d_(
     'chat',
     'CHAT',
@@ -1132,7 +1479,7 @@ function fetchUserAndActivityAuditMetrics_(
     directoryData
   );
 
-  // Contacts Audit Events + OAuth Token Contacts Events (for 28-day Contacts active users per domain)
+  // Contacts Audit Events + OAuth Token Contacts Events
   const contactsAuditEvents = processSimpleAppActivityAudit28d_(
     'contacts',
     'CONTACTS',
@@ -1147,7 +1494,7 @@ function fetchUserAndActivityAuditMetrics_(
   );
   auditStats.eventsProcessedByApp.contacts = contactsAuditEvents + contactsTokenEvents;
 
-  // Login Audit Events (supplements 28-day overall Workspace active users per domain)
+  // Login Audit Events (supplements Workspace login activity)
   auditStats.eventsProcessedByApp.login = processLoginActivityAudit28d_(
     windowInfo,
     orgInfo,
@@ -1156,18 +1503,23 @@ function fetchUserAndActivityAuditMetrics_(
 
   return {
     auditStats: auditStats,
-    meetAuditConferences: meetAuditResult.conferencesMap
+    orgMeetMetrics: meetAuditResult.orgMeetMetrics,
+    domainMeetMetrics: meetAuditResult.domainMeetMetricsMap
   };
 }
 
 /**
- * Processes Drive Audit logs (`applicationName = 'drive'`) over the 28-day window
- * to accurately attribute Drive, Docs (`doc_type=document`), Sheets (`doc_type=spreadsheet`),
- * and Slides (`doc_type=presentation`) adoption per user and domain.
+ * Processes Drive Audit logs with partial response fields to attribute Drive, Docs, Sheets,
+ * and Slides adoption per user and domain without full object retention.
  */
 function processDriveActivityAudit28d_(windowInfo, orgInfo, directoryData) {
   let eventsCount = 0;
-  paginateActivityAudit_('drive', windowInfo, (item) => {
+  const userMaskMap = directoryData.userMaskMap;
+  const domainStatsMap = directoryData.domainStatsMap;
+  const fields = 'nextPageToken,items(actor/email,events(parameters(name,value)))';
+  const maxPages = (REPORT_CONFIG.MAX_AUDIT_PAGES_BY_APP && REPORT_CONFIG.MAX_AUDIT_PAGES_BY_APP.drive) || 20;
+
+  paginateActivityAudit_('drive', windowInfo, fields, maxPages, (item) => {
     eventsCount++;
     const actorEmail = resolveUserEmail_(
       item.actor && item.actor.email,
@@ -1178,29 +1530,31 @@ function processDriveActivityAudit28d_(windowInfo, orgInfo, directoryData) {
       return;
     }
 
-    const userRec = getOrCreateUserRecord_(actorEmail, {}, orgInfo, directoryData);
-    const dStats = directoryData.domainStatsMap.get(userRec.domain);
-    markUserProductActive_(userRec, dStats, 'DRIVE');
+    markUserProductActiveFast_(actorEmail, '', 'DRIVE', userMaskMap, domainStatsMap, orgInfo);
 
     const events = item.events || [];
-    events.forEach((ev) => {
-      const evParams = parseActivityEventParameters_(ev.parameters || []);
-      const docType = String(evParams.doc_type || '').toLowerCase().trim();
-      if (docType === 'document' || docType === 'msword') {
-        markUserProductActive_(userRec, dStats, 'DOCS');
-      } else if (docType === 'spreadsheet' || docType === 'msexcel') {
-        markUserProductActive_(userRec, dStats, 'SHEETS');
-      } else if (docType === 'presentation' || docType === 'mspowerpoint') {
-        markUserProductActive_(userRec, dStats, 'SLIDES');
+    for (let eIdx = 0; eIdx < events.length; eIdx++) {
+      const pList = events[eIdx].parameters || [];
+      for (let pIdx = 0; pIdx < pList.length; pIdx++) {
+        if (pList[pIdx].name === 'doc_type') {
+          const docType = String(pList[pIdx].value || '').toLowerCase().trim();
+          if (docType === 'document' || docType === 'msword') {
+            markUserProductActiveFast_(actorEmail, '', 'DOCS', userMaskMap, domainStatsMap, orgInfo);
+          } else if (docType === 'spreadsheet' || docType === 'msexcel') {
+            markUserProductActiveFast_(actorEmail, '', 'SHEETS', userMaskMap, domainStatsMap, orgInfo);
+          } else if (docType === 'presentation' || docType === 'mspowerpoint') {
+            markUserProductActiveFast_(actorEmail, '', 'SLIDES', userMaskMap, domainStatsMap, orgInfo);
+          }
+          break;
+        }
       }
-    });
+    }
   });
   return eventsCount;
 }
 
 /**
- * Processes Activity Audit logs for applications where any user-initiated event
- * marks the actor as an active user of that product (`calendar`, `chat`, `contacts`).
+ * Processes Activity Audit logs for simple actor-based applications (calendar, chat, contacts).
  */
 function processSimpleAppActivityAudit28d_(
   applicationName,
@@ -1210,7 +1564,12 @@ function processSimpleAppActivityAudit28d_(
   directoryData
 ) {
   let eventsCount = 0;
-  paginateActivityAudit_(applicationName, windowInfo, (item) => {
+  const userMaskMap = directoryData.userMaskMap;
+  const domainStatsMap = directoryData.domainStatsMap;
+  const fields = 'nextPageToken,items(actor/email)';
+  const maxPages = (REPORT_CONFIG.MAX_AUDIT_PAGES_BY_APP && REPORT_CONFIG.MAX_AUDIT_PAGES_BY_APP[applicationName]) || 20;
+
+  paginateActivityAudit_(applicationName, windowInfo, fields, maxPages, (item) => {
     eventsCount++;
     const actorEmail = resolveUserEmail_(
       item.actor && item.actor.email,
@@ -1218,21 +1577,23 @@ function processSimpleAppActivityAudit28d_(
       directoryData
     );
     if (actorEmail && isInternalOrgEmail_(actorEmail, orgInfo, directoryData)) {
-      const userRec = getOrCreateUserRecord_(actorEmail, {}, orgInfo, directoryData);
-      const dStats = directoryData.domainStatsMap.get(userRec.domain);
-      markUserProductActive_(userRec, dStats, productKey);
+      markUserProductActiveFast_(actorEmail, '', productKey, userMaskMap, domainStatsMap, orgInfo);
     }
   });
   return eventsCount;
 }
 
 /**
- * Processes OAuth/Token Audit logs (`applicationName = 'token'`) for Google Contacts
- * web/mobile/API interactions to supplement Contacts mutation audit logs.
+ * Processes OAuth/Token Audit logs for Google Contacts interactions.
  */
 function processContactsTokenActivityAudit28d_(windowInfo, orgInfo, directoryData) {
   let eventsCount = 0;
-  paginateActivityAudit_('token', windowInfo, (item) => {
+  const userMaskMap = directoryData.userMaskMap;
+  const domainStatsMap = directoryData.domainStatsMap;
+  const fields = 'nextPageToken,items(actor/email,events(parameters(name,value)))';
+  const maxPages = (REPORT_CONFIG.MAX_AUDIT_PAGES_BY_APP && REPORT_CONFIG.MAX_AUDIT_PAGES_BY_APP.token) || 15;
+
+  paginateActivityAudit_('token', windowInfo, fields, maxPages, (item) => {
     const actorEmail = resolveUserEmail_(
       item.actor && item.actor.email,
       orgInfo,
@@ -1244,9 +1605,14 @@ function processContactsTokenActivityAudit28d_(windowInfo, orgInfo, directoryDat
 
     const events = item.events || [];
     for (let i = 0; i < events.length; i++) {
-      const evParams = parseActivityEventParameters_(events[i].parameters || []);
-      const appName = String(evParams.app_name || '').toLowerCase();
-      const scopeStr = String(evParams.scope || evParams.scope_data || '').toLowerCase();
+      const pList = events[i].parameters || [];
+      let appName = '';
+      let scopeStr = '';
+      for (let pIdx = 0; pIdx < pList.length; pIdx++) {
+        const p = pList[pIdx];
+        if (p.name === 'app_name') appName = String(p.value || '').toLowerCase();
+        else if (p.name === 'scope' || p.name === 'scope_data') scopeStr = String(p.value || '').toLowerCase();
+      }
       if (
         appName.includes('contact') ||
         scopeStr.includes('/auth/contacts') ||
@@ -1254,9 +1620,7 @@ function processContactsTokenActivityAudit28d_(windowInfo, orgInfo, directoryDat
         scopeStr.includes('people.googleapis.com')
       ) {
         eventsCount++;
-        const userRec = getOrCreateUserRecord_(actorEmail, {}, orgInfo, directoryData);
-        const dStats = directoryData.domainStatsMap.get(userRec.domain);
-        markUserProductActive_(userRec, dStats, 'CONTACTS');
+        markUserProductActiveFast_(actorEmail, '', 'CONTACTS', userMaskMap, domainStatsMap, orgInfo);
         break;
       }
     }
@@ -1265,11 +1629,16 @@ function processContactsTokenActivityAudit28d_(windowInfo, orgInfo, directoryDat
 }
 
 /**
- * Processes Login Audit logs (`applicationName = 'login'`) over the 28-day window.
+ * Processes Login Audit logs with partial response fields.
  */
 function processLoginActivityAudit28d_(windowInfo, orgInfo, directoryData) {
   let eventsCount = 0;
-  paginateActivityAudit_('login', windowInfo, (item) => {
+  const userMaskMap = directoryData.userMaskMap;
+  const domainStatsMap = directoryData.domainStatsMap;
+  const fields = 'nextPageToken,items(actor/email)';
+  const maxPages = (REPORT_CONFIG.MAX_AUDIT_PAGES_BY_APP && REPORT_CONFIG.MAX_AUDIT_PAGES_BY_APP.login) || 5;
+
+  paginateActivityAudit_('login', windowInfo, fields, maxPages, (item) => {
     eventsCount++;
     const actorEmail = resolveUserEmail_(
       item.actor && item.actor.email,
@@ -1277,30 +1646,138 @@ function processLoginActivityAudit28d_(windowInfo, orgInfo, directoryData) {
       directoryData
     );
     if (actorEmail && isInternalOrgEmail_(actorEmail, orgInfo, directoryData)) {
-      const userRec = getOrCreateUserRecord_(actorEmail, {}, orgInfo, directoryData);
-      const dStats = directoryData.domainStatsMap.get(userRec.domain);
-      markUserActiveInWorkspace_(userRec, dStats);
+      markUserActiveInWorkspaceFast_(actorEmail, '', userMaskMap, domainStatsMap, orgInfo);
     }
   });
   return eventsCount;
 }
 
 /**
- * Processes Google Meet Audit logs (`applicationName = 'meet'`) over the 28-day
- * window. Tracks both:
- * 1. Per-user & per-domain Meet adoption (`MEET` product active users), and
- * 2. Conference-level Meet metrics matching `MeetUsageMetricsFlume.java`:
- *    - Groups endpoints by `conference_id`
- *    - Filters to meetings with >= 2 participants/endpoints (excluding 1-caller lonely meetings)
- *    - Tracks duration seconds, screen sharing (`screencast_send_seconds > 0` or
- *      `presentation_started`), recordings (`recording_activity`), live streams
- *      (`broadcast_activity` / `livestream_watched`), and >100 participants.
+ * Meet Audit conference aggregation helper structures.
  */
-function processMeetActivityAudit28d_(windowInfo, orgInfo, directoryData) {
+function createEmptyMeetAuditAgg_() {
+  return {
+    validMeetings: 0,
+    totalEndpointSeconds: 0,
+    totalConferenceMinutes: 0,
+    screencastMeetings: 0,
+    recordedMeetings: 0,
+    liveStreamMeetings: 0,
+    over100ParticipantMeetings: 0
+  };
+}
+
+function addConfToAgg_(agg, conf, endpointCount, confMinutes) {
+  agg.validMeetings++;
+  agg.totalEndpointSeconds += conf.totalEndpointSeconds;
+  agg.totalConferenceMinutes += confMinutes;
+  if (conf.hasScreencast) agg.screencastMeetings++;
+  if (conf.hasRecording) agg.recordedMeetings++;
+  if (conf.hasLiveStream) agg.liveStreamMeetings++;
+  if (endpointCount > 100) agg.over100ParticipantMeetings++;
+}
+
+function finalizeMeetSummaryFromAgg_(agg, dailyMeetRollup) {
+  const rollupMeetings = dailyMeetRollup ? dailyMeetRollup.totalMeetings28d : 0;
+  const rollupAvgMins = dailyMeetRollup ? dailyMeetRollup.avgMeetingMinutes28d : 0;
+  const rollupTotalMins = dailyMeetRollup ? dailyMeetRollup.totalMeetingMinutes28d : 0;
+
+  const totalMeetings = Math.max(rollupMeetings, agg.validMeetings);
+  let avgMeetingTimeMinutes = 0;
+  if (rollupAvgMins > 0) {
+    avgMeetingTimeMinutes = rollupAvgMins;
+  } else if (agg.validMeetings > 0) {
+    avgMeetingTimeMinutes = Math.round(
+      agg.totalEndpointSeconds > 0
+        ? agg.totalEndpointSeconds / (agg.validMeetings * 60)
+        : agg.totalConferenceMinutes / agg.validMeetings
+    );
+  }
+
+  const totalMeetingMinutes =
+    rollupTotalMins > 0
+      ? rollupTotalMins
+      : Math.round(agg.totalConferenceMinutes || totalMeetings * avgMeetingTimeMinutes);
+
+  const hasData = totalMeetings > 0 || agg.validMeetings > 0;
+  const isGranular = Boolean(agg.validMeetings > 0 || (dailyMeetRollup && !dailyMeetRollup.isBaselineOnly));
+
+  return {
+    hasData: hasData,
+    isGranular: isGranular,
+    numMeetings: totalMeetings,
+    avgMeetingTimeMinutes: avgMeetingTimeMinutes,
+    totalMeetingMinutes: totalMeetingMinutes,
+    numScreencastMeetings: agg.screencastMeetings,
+    pctScreencastMeetings: totalMeetings > 0 ? agg.screencastMeetings / totalMeetings : 0,
+    numRecordedMeetings: agg.recordedMeetings,
+    pctRecordedMeetings: totalMeetings > 0 ? agg.recordedMeetings / totalMeetings : 0,
+    numLiveStreamMeetings: agg.liveStreamMeetings,
+    pctLiveStreamMeetings: totalMeetings > 0 ? agg.liveStreamMeetings / totalMeetings : 0,
+    numOver100Meetings: agg.over100ParticipantMeetings,
+    pctOver100Meetings: totalMeetings > 0 ? agg.over100ParticipantMeetings / totalMeetings : 0
+  };
+}
+
+/**
+ * Fast stream processor for Google Meet activity audit:
+ * Extracts user emails from actor and event parameters (identifier, organizer_email, participant_email)
+ * to mark users active in MEET across domains with 100% precision for the Adoption Scorecard.
+ * Skips all conference-level aggregation, duration math, and feature tracking for maximum speed.
+ */
+function processMeetActiveUsersAudit28d_(windowInfo, orgInfo, directoryData) {
+  let eventsProcessed = 0;
+  const userMaskMap = directoryData.userMaskMap;
+  const domainStatsMap = directoryData.domainStatsMap;
+  const fields = 'nextPageToken,items(actor/email,events(parameters(name,value)))';
+  const maxPages = (REPORT_CONFIG.MAX_AUDIT_PAGES_BY_APP && REPORT_CONFIG.MAX_AUDIT_PAGES_BY_APP.meet) || 35;
+
+  paginateActivityAudit_('meet', windowInfo, fields, maxPages, (item) => {
+    eventsProcessed++;
+    const actorEmail = resolveUserEmail_(
+      item.actor && item.actor.email,
+      orgInfo,
+      directoryData
+    );
+    if (actorEmail && isInternalOrgEmail_(actorEmail, orgInfo, directoryData)) {
+      markUserProductActiveFast_(actorEmail, '', 'MEET', userMaskMap, domainStatsMap, orgInfo);
+    }
+
+    const events = item.events || [];
+    for (let eIdx = 0; eIdx < events.length; eIdx++) {
+      const pList = events[eIdx].parameters || [];
+      for (let pIdx = 0; pIdx < pList.length; pIdx++) {
+        const param = pList[pIdx];
+        const pName = param.name;
+        if (pName === 'identifier' || pName === 'organizer_email' || pName === 'participant_email') {
+          const rawEmail = String(param.value || '').trim();
+          if (rawEmail && rawEmail.includes('@')) {
+            const normEmail = resolveUserEmail_(rawEmail, orgInfo, directoryData);
+            if (normEmail && isInternalOrgEmail_(normEmail, orgInfo, directoryData)) {
+              markUserProductActiveFast_(normEmail, '', 'MEET', userMaskMap, domainStatsMap, orgInfo);
+            }
+          }
+        }
+      }
+    }
+  });
+
+  return eventsProcessed;
+}
+
+/**
+ * Processes Google Meet Audit logs with immediate in-flight conference aggregation
+ * and disposal, preventing memory heap exhaustion on large organizations.
+ */
+function processMeetActivityAudit28d_(windowInfo, orgInfo, directoryData, customerUsage) {
   let eventsProcessed = 0;
   const conferencesMap = new Map();
+  const userMaskMap = directoryData.userMaskMap;
+  const domainStatsMap = directoryData.domainStatsMap;
+  const fields = 'nextPageToken,items(id/time,actor/email,events(name,parameters(name,value,intValue)))';
+  const maxPages = (REPORT_CONFIG.MAX_AUDIT_PAGES_BY_APP && REPORT_CONFIG.MAX_AUDIT_PAGES_BY_APP.meet) || 35;
 
-  paginateActivityAudit_('meet', windowInfo, (item) => {
+  paginateActivityAudit_('meet', windowInfo, fields, maxPages, (item) => {
     eventsProcessed++;
     const eventTimeMs = parseTimestampToMs_(item.id && item.id.time);
     const actorEmail = resolveUserEmail_(
@@ -1309,78 +1786,100 @@ function processMeetActivityAudit28d_(windowInfo, orgInfo, directoryData) {
       directoryData
     );
     if (actorEmail && isInternalOrgEmail_(actorEmail, orgInfo, directoryData)) {
-      const userRec = getOrCreateUserRecord_(actorEmail, {}, orgInfo, directoryData);
-      const dStats = directoryData.domainStatsMap.get(userRec.domain);
-      markUserProductActive_(userRec, dStats, 'MEET');
+      markUserProductActiveFast_(actorEmail, '', 'MEET', userMaskMap, domainStatsMap, orgInfo);
     }
 
     const events = item.events || [];
-    events.forEach((ev) => {
+    for (let eIdx = 0; eIdx < events.length; eIdx++) {
+      const ev = events[eIdx];
       const evName = String(ev.name || '').toLowerCase();
-      const p = parseActivityEventParameters_(ev.parameters || []);
+      const pList = ev.parameters || [];
 
-      // Mark participant/organizer as active in Meet if they belong to any org domain
-      const participantEmail =
-        p.identifier_type === 'email_address'
-          ? resolveUserEmail_(p.identifier, orgInfo, directoryData)
-          : '';
-      const organizerEmail = resolveUserEmail_(p.organizer_email, orgInfo, directoryData);
+      let confId = '';
+      let organizerEmail = '';
+      let participantEmail = '';
+      let endpointKey = '';
+      let durSec = 0;
+      let startSec = 0;
+      let hasScreencast = false;
+      let actionType = '';
 
-      if (participantEmail && isInternalOrgEmail_(participantEmail, orgInfo, directoryData)) {
-        const uRec = getOrCreateUserRecord_(participantEmail, {}, orgInfo, directoryData);
-        const dStats = directoryData.domainStatsMap.get(uRec.domain);
-        markUserProductActive_(uRec, dStats, 'MEET');
+      for (let pIdx = 0; pIdx < pList.length; pIdx++) {
+        const param = pList[pIdx];
+        const pName = param.name;
+        if (!pName) continue;
+
+        if (pName === 'conference_id' || pName === 'meeting_code') {
+          confId = String(param.value || '').trim();
+        } else if (pName === 'organizer_email') {
+          organizerEmail = String(param.value || '').trim();
+        } else if (pName === 'identifier') {
+          participantEmail = String(param.value || '').trim();
+          endpointKey = participantEmail;
+        } else if (pName === 'endpoint_id' || pName === 'display_name') {
+          if (!endpointKey) endpointKey = String(param.value || '').trim();
+        } else if (pName === 'duration_seconds') {
+          durSec = Number(param.intValue || param.value || 0);
+        } else if (pName === 'start_timestamp_seconds') {
+          startSec = Number(param.intValue || param.value || 0);
+        } else if (pName === 'screencast_send_seconds' || pName === 'screencast_recv_seconds') {
+          if (Number(param.intValue || param.value || 0) > 0) hasScreencast = true;
+        } else if (pName === 'action_type') {
+          actionType = String(param.value || '').toLowerCase();
+        }
       }
-      if (organizerEmail && isInternalOrgEmail_(organizerEmail, orgInfo, directoryData)) {
-        const uRec = getOrCreateUserRecord_(organizerEmail, {}, orgInfo, directoryData);
-        const dStats = directoryData.domainStatsMap.get(uRec.domain);
-        markUserProductActive_(uRec, dStats, 'MEET');
+
+      if (participantEmail) {
+        const pEmailNorm = resolveUserEmail_(participantEmail, orgInfo, directoryData);
+        if (pEmailNorm && isInternalOrgEmail_(pEmailNorm, orgInfo, directoryData)) {
+          markUserProductActiveFast_(pEmailNorm, '', 'MEET', userMaskMap, domainStatsMap, orgInfo);
+        }
+      }
+      if (organizerEmail) {
+        const oEmailNorm = resolveUserEmail_(organizerEmail, orgInfo, directoryData);
+        if (oEmailNorm && isInternalOrgEmail_(oEmailNorm, orgInfo, directoryData)) {
+          markUserProductActiveFast_(oEmailNorm, '', 'MEET', userMaskMap, domainStatsMap, orgInfo);
+        }
       }
 
-      // Conference-level aggregation for MEET USAGE scorecard section
-      const confId = String(p.conference_id || p.meeting_code || '').trim();
-      if (!confId) return;
+      if (!confId) continue;
 
-      if (!conferencesMap.has(confId)) {
-        conferencesMap.set(confId, {
-          conferenceId: confId,
-          organizerEmail: organizerEmail || '',
-          organizerDomain:
-            organizerEmail && organizerEmail.includes('@')
-              ? organizerEmail.split('@')[1]
-              : '',
+      let conf = conferencesMap.get(confId);
+      if (!conf) {
+        let orgDomain = '';
+        if (organizerEmail && organizerEmail.includes('@')) {
+          orgDomain = organizerEmail.split('@')[1].toLowerCase().trim();
+          if (orgInfo.aliasToParentDomain && orgInfo.aliasToParentDomain.has(orgDomain)) {
+            orgDomain = orgInfo.aliasToParentDomain.get(orgDomain);
+          }
+        }
+        conf = {
+          organizerDomain: orgDomain || orgInfo.primaryDomain,
           endpointsSet: new Set(),
-          participantsSet: new Set(),
           totalEndpointSeconds: 0,
           minStartEpochSec: null,
           maxEndEpochSec: null,
           hasScreencast: false,
           hasRecording: false,
           hasLiveStream: false
-        });
+        };
+        conferencesMap.set(confId, conf);
       }
 
-      const conf = conferencesMap.get(confId);
-      if (!conf.organizerEmail && organizerEmail) {
-        conf.organizerEmail = organizerEmail;
-        if (organizerEmail.includes('@')) {
-          conf.organizerDomain = organizerEmail.split('@')[1];
+      if (!conf.organizerDomain && organizerEmail && organizerEmail.includes('@')) {
+        let orgDomain = organizerEmail.split('@')[1].toLowerCase().trim();
+        if (orgInfo.aliasToParentDomain && orgInfo.aliasToParentDomain.has(orgDomain)) {
+          orgDomain = orgInfo.aliasToParentDomain.get(orgDomain);
         }
+        conf.organizerDomain = orgDomain;
       }
 
       if (evName === 'call_ended') {
-        const endpointKey = String(
-          p.endpoint_id || p.identifier || p.display_name || `${eventsProcessed}`
-        );
-        conf.endpointsSet.add(endpointKey);
-        if (p.identifier) {
-          conf.participantsSet.add(String(p.identifier).toLowerCase());
+        const epKey = endpointKey || `${eventsProcessed}_${eIdx}`;
+        if (conf.endpointsSet.size <= 101) {
+          conf.endpointsSet.add(epKey);
         }
-
-        const durSec = toInt_(p.duration_seconds);
         conf.totalEndpointSeconds += durSec;
-
-        const startSec = toInt_(p.start_timestamp_seconds);
         const endSec =
           eventTimeMs !== null
             ? Math.floor(eventTimeMs / 1000)
@@ -1393,56 +1892,98 @@ function processMeetActivityAudit28d_(windowInfo, orgInfo, directoryData) {
         if (endSec > 0 && (conf.maxEndEpochSec === null || endSec > conf.maxEndEpochSec)) {
           conf.maxEndEpochSec = endSec;
         }
-
-        if (
-          toInt_(p.screencast_send_seconds) > 0 ||
-          toInt_(p.screencast_recv_seconds) > 0
-        ) {
-          conf.hasScreencast = true;
-        }
-      } else if (
-        evName === 'presentation_started' ||
-        evName === 'presentation_stopped'
-      ) {
+        if (hasScreencast) conf.hasScreencast = true;
+      } else if (evName === 'presentation_started' || evName === 'presentation_stopped') {
         conf.hasScreencast = true;
       } else if (evName === 'recording_activity') {
         conf.hasRecording = true;
-      } else if (
-        evName === 'broadcast_activity' ||
-        evName === 'livestream_watched'
-      ) {
+      } else if (evName === 'broadcast_activity' || evName === 'livestream_watched') {
         conf.hasLiveStream = true;
       } else if (evName === 'streaming_session_explicit_consent') {
-        const actionType = String(p.action_type || '').toLowerCase();
         if (actionType.includes('record')) conf.hasRecording = true;
-        if (actionType.includes('stream') || actionType.includes('broadcast')) {
-          conf.hasLiveStream = true;
-        }
+        if (actionType.includes('stream') || actionType.includes('broadcast')) conf.hasLiveStream = true;
       }
-    });
+    }
   });
 
-  // Also link each conference to its organizer's domain stats if internal
-  conferencesMap.forEach((conf, confId) => {
-    const dom = conf.organizerDomain || orgInfo.primaryDomain;
-    if (directoryData.domainStatsMap.has(dom)) {
-      directoryData.domainStatsMap.get(dom).meetConferencesMap.set(confId, conf);
+  // Aggregate conferences immediately by domain & organization
+  const orgAgg = createEmptyMeetAuditAgg_();
+  const domainAggMap = new Map();
+  domainStatsMap.forEach((_, dom) => {
+    domainAggMap.set(dom, createEmptyMeetAuditAgg_());
+  });
+
+  conferencesMap.forEach((conf) => {
+    const endpointCount = conf.endpointsSet.size;
+    if (endpointCount < 2) return; // Skip lonely meetings (< 2 participants)
+
+    let confMinutes = 0;
+    if (
+      conf.minStartEpochSec !== null &&
+      conf.maxEndEpochSec !== null &&
+      conf.maxEndEpochSec > conf.minStartEpochSec
+    ) {
+      confMinutes = (conf.maxEndEpochSec - conf.minStartEpochSec) / 60;
+    } else if (conf.totalEndpointSeconds > 0) {
+      confMinutes = conf.totalEndpointSeconds / 60;
     }
+
+    addConfToAgg_(orgAgg, conf, endpointCount, confMinutes);
+
+    const dom = conf.organizerDomain || orgInfo.primaryDomain;
+    let dAgg = domainAggMap.get(dom);
+    if (!dAgg) {
+      dAgg = createEmptyMeetAuditAgg_();
+      domainAggMap.set(dom, dAgg);
+    }
+    addConfToAgg_(dAgg, conf, endpointCount, confMinutes);
+  });
+
+  // CLEAR conferencesMap completely to free memory immediately!
+  conferencesMap.clear();
+
+  // Compute final summary objects
+  const dailyRollup = customerUsage ? customerUsage.dailyMeetRollup : null;
+  const isSingleDomain = domainStatsMap.size === 1;
+  const orgMeetMetrics = finalizeMeetSummaryFromAgg_(orgAgg, dailyRollup);
+
+  const domainMeetMetricsMap = new Map();
+  domainAggMap.forEach((dAgg, dom) => {
+    domainMeetMetricsMap.set(
+      dom,
+      finalizeMeetSummaryFromAgg_(dAgg, isSingleDomain ? dailyRollup : null)
+    );
   });
 
   return {
     eventsProcessed: eventsProcessed,
-    conferencesMap: conferencesMap
+    orgMeetMetrics: orgMeetMetrics,
+    domainMeetMetricsMap: domainMeetMetricsMap
   };
 }
 
 /**
  * Helper to paginate `AdminReports.Activities.list('all', applicationName, ...)`
- * across the 28-day window with retry & page cap safeguards.
+ * across the 28-day window with retry, partial response fields, and page cap safeguards.
  */
-function paginateActivityAudit_(applicationName, windowInfo, onItemCallback) {
+function paginateActivityAudit_(applicationName, windowInfo, fields, maxPagesOverride, onItemCallback) {
+  // Support legacy signature: paginateActivityAudit_(appName, windowInfo, onItemCallback)
+  let actualFields = fields;
+  let actualMaxPages = maxPagesOverride;
+  let callback = onItemCallback;
+  if (typeof fields === 'function') {
+    callback = fields;
+    actualFields = null;
+    actualMaxPages = null;
+  }
+
   let pageToken = null;
   let pagesFetched = 0;
+  const maxPages =
+    actualMaxPages ||
+    (REPORT_CONFIG.MAX_AUDIT_PAGES_BY_APP && REPORT_CONFIG.MAX_AUDIT_PAGES_BY_APP[applicationName]) ||
+    REPORT_CONFIG.MAX_AUDIT_PAGES_PER_APP ||
+    20;
 
   do {
     const queryParams = {
@@ -1450,6 +1991,9 @@ function paginateActivityAudit_(applicationName, windowInfo, onItemCallback) {
       endTime: windowInfo.windowEndIso,
       maxResults: REPORT_CONFIG.AUDIT_MAX_RESULTS
     };
+    if (actualFields) {
+      queryParams.fields = actualFields;
+    }
     if (pageToken) {
       queryParams.pageToken = pageToken;
     }
@@ -1460,18 +2004,30 @@ function paginateActivityAudit_(applicationName, windowInfo, onItemCallback) {
         AdminReports.Activities.list('all', applicationName, queryParams)
       );
     } catch (e) {
-      Logger.log(`Activities.list(${applicationName}) warning: ` + e.message);
-      break;
+      if (queryParams.fields) {
+        delete queryParams.fields;
+        try {
+          resp = executeWithRetry_(() =>
+            AdminReports.Activities.list('all', applicationName, queryParams)
+          );
+        } catch (innerErr) {
+          Logger.log(`Activities.list(${applicationName}) warning: ` + innerErr.message);
+          break;
+        }
+      } else {
+        Logger.log(`Activities.list(${applicationName}) warning: ` + e.message);
+        break;
+      }
     }
 
     const items = (resp && resp.items) || [];
     for (let i = 0; i < items.length; i++) {
-      onItemCallback(items[i]);
+      callback(items[i]);
     }
 
     pagesFetched++;
     pageToken = resp ? resp.nextPageToken : null;
-  } while (pageToken && pagesFetched < REPORT_CONFIG.MAX_AUDIT_PAGES_PER_APP);
+  } while (pageToken && pagesFetched < maxPages);
 }
 
 /**
@@ -1512,7 +2068,10 @@ function buildReconciledReportModel_(
   });
 
   domainList.forEach((d) => {
-    directWorkspaceActive28d += d.activeWorkspaceUsersSet.size;
+    const wsActive = d.directWorkspaceActiveCount !== undefined
+      ? d.directWorkspaceActiveCount
+      : (d.activeWorkspaceUsersSet ? d.activeWorkspaceUsersSet.size : 0);
+    directWorkspaceActive28d += wsActive;
     totalProvisionedUsers += d.totalUsers;
     totalActiveProvisionedUsers += d.activeProvisionedUsers;
     totalSuspendedUsers += d.suspendedUsers;
@@ -1520,7 +2079,10 @@ function buildReconciledReportModel_(
     totalStorageUsedMb += d.storageUsedMb;
 
     WORKSPACE_PRODUCTS.forEach((p) => {
-      directProductCounts28d[p.key] += d.productActiveUsersSets[p.key].size;
+      const pCount = (d.productCounts && d.productCounts[p.key] !== undefined)
+        ? d.productCounts[p.key]
+        : (d.productActiveUsersSets && d.productActiveUsersSets[p.key] ? d.productActiveUsersSets[p.key].size : 0);
+      directProductCounts28d[p.key] += pCount;
     });
   });
 
@@ -1611,25 +2173,30 @@ function buildReconciledReportModel_(
   // Reconcile per-domain metrics (attributing any passive-view delta from CustomerUsageReports
   // across domains using Largest Remainder integer apportionment so domain counts always sum
   // exact-to-the-integer to the organization totals while respecting per-domain ceilings)
-  const domainShares = domainList.map((d) =>
-    directWorkspaceActive28d > 0
-      ? d.activeWorkspaceUsersSet.size / directWorkspaceActive28d
+  const domainShares = domainList.map((d) => {
+    const wsActive = d.directWorkspaceActiveCount !== undefined ? d.directWorkspaceActiveCount : (d.activeWorkspaceUsersSet ? d.activeWorkspaceUsersSet.size : 0);
+    return directWorkspaceActive28d > 0
+      ? wsActive / directWorkspaceActive28d
       : totalProvisionedUsers > 0
       ? d.totalUsers / totalProvisionedUsers
-      : 1 / Math.max(1, domainList.length)
-  );
+      : 1 / Math.max(1, domainList.length);
+  });
 
   const domainWorkspaceDelta = Math.max(0, workspaceActiveUsers28d - directWorkspaceActive28d);
   const apportionedWsDeltas = apportionIntegerDelta_(
     domainWorkspaceDelta,
     domainShares,
-    domainList.map((d) =>
-      Math.max(0, (d.totalUsers || workspaceActiveUsers28d) - d.activeWorkspaceUsersSet.size)
-    )
+    domainList.map((d) => {
+      const wsActive = d.directWorkspaceActiveCount !== undefined ? d.directWorkspaceActiveCount : (d.activeWorkspaceUsersSet ? d.activeWorkspaceUsersSet.size : 0);
+      return Math.max(0, (d.totalUsers || workspaceActiveUsers28d) - wsActive);
+    })
   );
 
   const domainWorkspaceActives = domainList.map(
-    (d, idx) => d.activeWorkspaceUsersSet.size + apportionedWsDeltas[idx]
+    (d, idx) => {
+      const wsActive = d.directWorkspaceActiveCount !== undefined ? d.directWorkspaceActiveCount : (d.activeWorkspaceUsersSet ? d.activeWorkspaceUsersSet.size : 0);
+      return wsActive + apportionedWsDeltas[idx];
+    }
   );
 
   const apportionedProductCountsByDomain = {};
@@ -1637,12 +2204,20 @@ function buildReconciledReportModel_(
     const orgReconciled = orgProductMetrics[p.key].activeUsers28d;
     const orgDirect = directProductCounts28d[p.key];
     const passiveDelta = Math.max(0, orgReconciled - orgDirect);
-    const capacities = domainList.map((d, idx) =>
-      Math.max(0, domainWorkspaceActives[idx] - d.productActiveUsersSets[p.key].size)
-    );
+    const capacities = domainList.map((d, idx) => {
+      const pCount = (d.productCounts && d.productCounts[p.key] !== undefined)
+        ? d.productCounts[p.key]
+        : (d.productActiveUsersSets && d.productActiveUsersSets[p.key] ? d.productActiveUsersSets[p.key].size : 0);
+      return Math.max(0, domainWorkspaceActives[idx] - pCount);
+    });
     const deltas = apportionIntegerDelta_(passiveDelta, domainShares, capacities);
     apportionedProductCountsByDomain[p.key] = domainList.map(
-      (d, idx) => d.productActiveUsersSets[p.key].size + deltas[idx]
+      (d, idx) => {
+        const pCount = (d.productCounts && d.productCounts[p.key] !== undefined)
+          ? d.productCounts[p.key]
+          : (d.productActiveUsersSets && d.productActiveUsersSets[p.key] ? d.productActiveUsersSets[p.key].size : 0);
+        return pCount + deltas[idx];
+      }
     );
   });
 
@@ -1650,7 +2225,9 @@ function buildReconciledReportModel_(
     const domainWorkspaceActive28d = domainWorkspaceActives[idx];
     const domainProducts = {};
     WORKSPACE_PRODUCTS.forEach((p) => {
-      const directDomCount = d.productActiveUsersSets[p.key].size;
+      const directDomCount = (d.productCounts && d.productCounts[p.key] !== undefined)
+        ? d.productCounts[p.key]
+        : (d.productActiveUsersSets && d.productActiveUsersSets[p.key] ? d.productActiveUsersSets[p.key].size : 0);
       const estDomCount = apportionedProductCountsByDomain[p.key][idx];
 
       domainProducts[p.key] = {
@@ -1662,10 +2239,15 @@ function buildReconciledReportModel_(
       };
     });
 
-    const domainMeetMetrics = computeMeetSummaryFromConferences_(
-      d.meetConferencesMap,
-      domainList.length === 1 ? customerUsage.dailyMeetRollup : null
-    );
+    const domainMeetMetrics = (userAndAuditUsage && userAndAuditUsage.domainMeetMetrics && userAndAuditUsage.domainMeetMetrics.get(d.domainName)) ||
+      computeMeetSummaryFromConferences_(
+        d.meetConferencesMap,
+        domainList.length === 1 ? customerUsage.dailyMeetRollup : null
+      );
+
+    const directWsActive = d.directWorkspaceActiveCount !== undefined
+      ? d.directWorkspaceActiveCount
+      : (d.activeWorkspaceUsersSet ? d.activeWorkspaceUsersSet.size : 0);
 
     return {
       domainName: d.domainName,
@@ -1681,7 +2263,7 @@ function buildReconciledReportModel_(
       storageUsedGb: d.storageUsedMb / 1024,
       shareOfOrgUsers: totalProvisionedUsers > 0 ? d.totalUsers / totalProvisionedUsers : 0,
       workspaceActiveUsers28d: domainWorkspaceActive28d,
-      directWorkspaceActiveUsers28d: d.activeWorkspaceUsersSet.size,
+      directWorkspaceActiveUsers28d: directWsActive,
       workspaceAdoptionPct:
         d.totalUsers > 0 ? domainWorkspaceActive28d / d.totalUsers : 0,
       products: domainProducts,
@@ -1691,10 +2273,16 @@ function buildReconciledReportModel_(
 
   // Compute organization-wide Meet Usage (combining 28-day daily CustomerUsageReports
   // and 28-day Meet Audit conference logs)
-  const orgMeetMetrics = computeMeetSummaryFromConferences_(
-    userAndAuditUsage.meetAuditConferences,
-    customerUsage.dailyMeetRollup
-  );
+  const orgMeetMetrics = (userAndAuditUsage && userAndAuditUsage.orgMeetMetrics) ||
+    computeMeetSummaryFromConferences_(
+      userAndAuditUsage && userAndAuditUsage.meetAuditConferences,
+      customerUsage.dailyMeetRollup
+    );
+
+  // Clear userMaskMap to release heap memory immediately before rendering sheets
+  if (directoryData && directoryData.userMaskMap) {
+    directoryData.userMaskMap.clear();
+  }
 
   return {
     orgInfo: orgInfo,
@@ -2192,132 +2780,7 @@ function renderScorecardSheet_(sheet, model, singleDomainFilter) {
   // --------------------------------------------------------------------------
   // ROWS 24..29: 2x3 MEET USAGE SCORECARD GRID (NUMBERS & PERCENTAGES)
   // --------------------------------------------------------------------------
-  const m = model.meet;
-  const meetCardsRow1 = [
-    {
-      badge: '📹 Meetings',
-      badgeColor: '#00897B',
-      primaryText: m.hasData ? formatNumber_(m.numMeetings) : '-',
-      secondaryText: m.hasData
-        ? `(${(m.numMeetings / windowDays).toFixed(1)} meetings/day avg)`
-        : '(No data found in the past 28 days)',
-      caption: `Number of meetings in the past ${windowDays} days`
-    },
-    {
-      badge: '⏱️ Duration',
-      badgeColor: '#00897B',
-      primaryText: m.hasData ? `${formatNumber_(m.avgMeetingTimeMinutes)} min` : '-',
-      secondaryText: m.hasData
-        ? `(${formatNumber_(m.totalMeetingMinutes)} total mins)`
-        : '(No data found in the past 28 days)',
-      caption: `Average meeting time in minutes in the past ${windowDays} days`
-    },
-    {
-      badge: '🖥️ Share',
-      badgeColor: '#00897B',
-      primaryText: m.hasData ? formatNumber_(m.numScreencastMeetings) : '-',
-      secondaryText: m.hasData
-        ? `(${(m.pctScreencastMeetings * 100).toFixed(1)}% of meetings)`
-        : '(No data found in the past 28 days)',
-      caption: `Number of meetings that used screen sharing in the past ${windowDays} days`
-    }
-  ];
-
-  const meetCardsRow2 = [
-    {
-      badge: '⏺️ REC',
-      badgeColor: '#D93025',
-      primaryText: m.hasData ? formatNumber_(m.numRecordedMeetings) : '-',
-      secondaryText: m.hasData
-        ? `(${(m.pctRecordedMeetings * 100).toFixed(1)}% of meetings)`
-        : '(No data found in the past 28 days)',
-      caption: `Number of meetings that were recorded in the past ${windowDays} days`
-    },
-    {
-      badge: '📡 Live',
-      badgeColor: '#E37400',
-      primaryText: m.hasData ? formatNumber_(m.numLiveStreamMeetings) : '-',
-      secondaryText: m.hasData
-        ? `(${(m.pctLiveStreamMeetings * 100).toFixed(1)}% of meetings)`
-        : '(No data found in the past 28 days)',
-      caption: `Number of meetings that were live streamed in the past ${windowDays} days`
-    },
-    {
-      badge: '👥 100+',
-      badgeColor: '#00897B',
-      primaryText: m.hasData ? formatNumber_(m.numOver100Meetings) : '-',
-      secondaryText: m.hasData
-        ? `(${(m.pctOver100Meetings * 100).toFixed(1)}% of meetings)`
-        : '(No data found in the past 28 days)',
-      caption: `Number of meetings with more than 100 participants in the past ${windowDays} days`
-    }
-  ];
-
-  [
-    { startRow: 24, bg: C.CARD_WHITE_BG, cards: meetCardsRow1 },
-    { startRow: 27, bg: C.CARD_GREY_BG, cards: meetCardsRow2 }
-  ].forEach((meetRowGroup) => {
-    const r = meetRowGroup.startRow;
-    sheet.setRowHeight(r, 36);
-    sheet.setRowHeight(r + 1, 16);
-    sheet.setRowHeight(r + 2, 30);
-    sheet.getRange(r, 2, 3, 9).setBackground(meetRowGroup.bg);
-
-    meetRowGroup.cards.forEach((card, idx) => {
-      const cols = cardColSets[idx];
-      sheet
-        .getRange(r, cols.iconCol, 2, 1)
-        .merge()
-        .setValue(card.badge)
-        .setBackground(card.badgeColor)
-        .setFontColor('#FFFFFF')
-        .setFontSize(9)
-        .setFontWeight('bold')
-        .setHorizontalAlignment('center')
-        .setVerticalAlignment('middle')
-        .setWrap(true);
-
-      const fullText = `${card.primaryText}  ${card.secondaryText}`;
-      const richMeet = SpreadsheetApp.newRichTextValue()
-        .setText(fullText)
-        .setTextStyle(
-          0,
-          card.primaryText.length,
-          SpreadsheetApp.newTextStyle()
-            .setFontSize(18)
-            .setForegroundColor(C.TEXT_SECONDARY)
-            .setBold(false)
-            .build()
-        )
-        .setTextStyle(
-          card.primaryText.length,
-          fullText.length,
-          SpreadsheetApp.newTextStyle()
-            .setFontSize(10)
-            .setForegroundColor(C.HERO_BLUE)
-            .setBold(true)
-            .build()
-        )
-        .build();
-
-      sheet
-        .getRange(r, cols.textStartCol, 2, 2)
-        .merge()
-        .setRichTextValue(richMeet)
-        .setHorizontalAlignment('left')
-        .setVerticalAlignment('middle');
-
-      sheet
-        .getRange(r + 2, cols.iconCol, 1, 3)
-        .merge()
-        .setValue(card.caption)
-        .setFontSize(9)
-        .setFontColor(C.TEXT_PRIMARY)
-        .setHorizontalAlignment('left')
-        .setVerticalAlignment('top')
-        .setWrap(true);
-    });
-  });
+  renderMeetScorecardCards_(sheet, model.meet, windowDays, 24);
 
   // Outer border around the visual Adoption Scorecard card (B2:J29)
   sheet
@@ -2463,7 +2926,8 @@ function renderScorecardSheet_(sheet, model, singleDomainFilter) {
     .setVerticalAlignment('middle')
     .setWrap(true);
   sheet.getRange(meetTableTitleRow, 2).setHorizontalAlignment('left');
-
+  const m = model.meet || {};
+  const isGranular = Boolean(m.isGranular);
   const meetDataRows = [
     [
       'Total Meetings Held (≥2 participants)',
@@ -2489,10 +2953,10 @@ function renderScorecardSheet_(sheet, model, singleDomainFilter) {
     ],
     [
       'Meetings with Screen Sharing',
-      m.numScreencastMeetings,
+      isGranular ? m.numScreencastMeetings : '—',
       'meetings',
-      m.pctScreencastMeetings,
-      m.numScreencastMeetings / windowDays,
+      isGranular ? m.pctScreencastMeetings : '—',
+      isGranular ? m.numScreencastMeetings / windowDays : '—',
       '—',
       '—',
       '—',
@@ -2500,10 +2964,10 @@ function renderScorecardSheet_(sheet, model, singleDomainFilter) {
     ],
     [
       'Meetings Recorded',
-      m.numRecordedMeetings,
+      isGranular ? m.numRecordedMeetings : '—',
       'meetings',
-      m.pctRecordedMeetings,
-      m.numRecordedMeetings / windowDays,
+      isGranular ? m.pctRecordedMeetings : '—',
+      isGranular ? m.numRecordedMeetings / windowDays : '—',
       '—',
       '—',
       '—',
@@ -2511,10 +2975,10 @@ function renderScorecardSheet_(sheet, model, singleDomainFilter) {
     ],
     [
       'Meetings Live Streamed',
-      m.numLiveStreamMeetings,
+      isGranular ? m.numLiveStreamMeetings : '—',
       'meetings',
-      m.pctLiveStreamMeetings,
-      m.numLiveStreamMeetings / windowDays,
+      isGranular ? m.pctLiveStreamMeetings : '—',
+      isGranular ? m.numLiveStreamMeetings / windowDays : '—',
       '—',
       '—',
       '—',
@@ -2522,10 +2986,10 @@ function renderScorecardSheet_(sheet, model, singleDomainFilter) {
     ],
     [
       'Meetings with >100 Participants',
-      m.numOver100Meetings,
+      isGranular ? m.numOver100Meetings : '—',
       'meetings',
-      m.pctOver100Meetings,
-      m.numOver100Meetings / windowDays,
+      isGranular ? m.pctOver100Meetings : '—',
+      isGranular ? m.numOver100Meetings / windowDays : '—',
       '—',
       '—',
       '—',
@@ -2545,8 +3009,15 @@ function renderScorecardSheet_(sheet, model, singleDomainFilter) {
     sheet.setRowHeight(r, 22);
     const bg = i % 2 === 0 ? C.CARD_WHITE_BG : '#F8F9FA';
     sheet.getRange(r, 2, 1, meetHeaders.length).setBackground(bg);
-    sheet.getRange(r, 3).setNumberFormat('#,##0').setHorizontalAlignment('right');
+
+    if (typeof meetDataRows[i][1] === 'number') {
+      sheet.getRange(r, 3).setNumberFormat('#,##0').setHorizontalAlignment('right');
+    } else {
+      sheet.getRange(r, 3).setHorizontalAlignment('center');
+    }
+
     sheet.getRange(r, 4).setHorizontalAlignment('center');
+
     if (typeof meetDataRows[i][3] === 'number') {
       sheet.getRange(r, 5).setNumberFormat('0.0%').setHorizontalAlignment('right');
       sheet
@@ -2555,8 +3026,30 @@ function renderScorecardSheet_(sheet, model, singleDomainFilter) {
     } else {
       sheet.getRange(r, 5).setHorizontalAlignment('center');
     }
-    sheet.getRange(r, 6).setNumberFormat('#,##0.0').setHorizontalAlignment('right');
-    sheet.getRange(r, 7, 1, 3).setNumberFormat('#,##0').setHorizontalAlignment('right');
+
+    if (typeof meetDataRows[i][4] === 'number') {
+      sheet.getRange(r, 6).setNumberFormat('#,##0.0').setHorizontalAlignment('right');
+    } else {
+      sheet.getRange(r, 6).setHorizontalAlignment('center');
+    }
+
+    if (typeof meetDataRows[i][5] === 'number') {
+      sheet.getRange(r, 7).setNumberFormat('#,##0').setHorizontalAlignment('right');
+    } else {
+      sheet.getRange(r, 7).setHorizontalAlignment('center');
+    }
+
+    if (typeof meetDataRows[i][6] === 'number') {
+      sheet.getRange(r, 8).setNumberFormat('#,##0').setHorizontalAlignment('right');
+    } else {
+      sheet.getRange(r, 8).setHorizontalAlignment('center');
+    }
+
+    if (typeof meetDataRows[i][7] === 'number') {
+      sheet.getRange(r, 9).setNumberFormat('#,##0').setHorizontalAlignment('right');
+    } else {
+      sheet.getRange(r, 9).setHorizontalAlignment('center');
+    }
   }
 
   sheet
@@ -2571,6 +3064,18 @@ function renderScorecardSheet_(sheet, model, singleDomainFilter) {
       C.BORDER_LIGHT,
       SpreadsheetApp.BorderStyle.SOLID
     );
+
+  if (!isGranular) {
+    const footnoteRow = meetStartRow + meetDataRows.length + 1;
+    sheet
+      .getRange(footnoteRow, 2, 1, meetHeaders.length)
+      .merge()
+      .setValue('* Note: Screen sharing, recordings, livestreams, and large meeting metrics are populated via the dedicated "📹 Generate Granular Meet Usage Report" menu item.')
+      .setFontSize(8)
+      .setFontColor(C.TEXT_MUTED)
+      .setFontStyle('italic')
+      .setVerticalAlignment('middle');
+  }
 }
 
 /**
@@ -2849,35 +3354,36 @@ function renderMultiDomainBreakdownSheet_(sheet, model) {
     .setWrap(true);
   sheet.getRange(rowCursor, 1).setHorizontalAlignment('left');
 
+  const om = model.meet || {};
+  const isMeetGranular = Boolean(om.isGranular);
   const meetDomRows = model.domains.map((d) => [
     d.domainName,
-    d.meet.numMeetings,
-    d.meet.totalMeetingMinutes,
-    d.meet.avgMeetingTimeMinutes,
-    d.meet.numScreencastMeetings,
-    d.meet.pctScreencastMeetings,
-    d.meet.numRecordedMeetings,
-    d.meet.pctRecordedMeetings,
-    d.meet.numLiveStreamMeetings,
-    d.meet.pctLiveStreamMeetings,
-    d.meet.numOver100Meetings,
-    d.meet.pctOver100Meetings
+    isMeetGranular ? d.meet.numMeetings : '—',
+    isMeetGranular ? d.meet.totalMeetingMinutes : '—',
+    isMeetGranular ? d.meet.avgMeetingTimeMinutes : '—',
+    isMeetGranular ? d.meet.numScreencastMeetings : '—',
+    isMeetGranular ? d.meet.pctScreencastMeetings : '—',
+    isMeetGranular ? d.meet.numRecordedMeetings : '—',
+    isMeetGranular ? d.meet.pctRecordedMeetings : '—',
+    isMeetGranular ? d.meet.numLiveStreamMeetings : '—',
+    isMeetGranular ? d.meet.pctLiveStreamMeetings : '—',
+    isMeetGranular ? d.meet.numOver100Meetings : '—',
+    isMeetGranular ? d.meet.pctOver100Meetings : '—'
   ]);
 
-  const om = model.meet;
   meetDomRows.push([
     'ALL DOMAINS (ORGANIZATION TOTAL)',
     om.numMeetings,
     om.totalMeetingMinutes,
     om.avgMeetingTimeMinutes,
-    om.numScreencastMeetings,
-    om.pctScreencastMeetings,
-    om.numRecordedMeetings,
-    om.pctRecordedMeetings,
-    om.numLiveStreamMeetings,
-    om.pctLiveStreamMeetings,
-    om.numOver100Meetings,
-    om.pctOver100Meetings
+    isMeetGranular ? om.numScreencastMeetings : '—',
+    isMeetGranular ? om.pctScreencastMeetings : '—',
+    isMeetGranular ? om.numRecordedMeetings : '—',
+    isMeetGranular ? om.pctRecordedMeetings : '—',
+    isMeetGranular ? om.numLiveStreamMeetings : '—',
+    isMeetGranular ? om.pctLiveStreamMeetings : '—',
+    isMeetGranular ? om.numOver100Meetings : '—',
+    isMeetGranular ? om.pctOver100Meetings : '—'
   ]);
 
   const meetDomStartRow = rowCursor + 1;
@@ -2895,19 +3401,39 @@ function renderMultiDomainBreakdownSheet_(sheet, model) {
       .getRange(r, 1, 1, meetDomHeaders.length)
       .setBackground(isTotal ? '#E8F0FE' : i % 2 === 0 ? '#FFFFFF' : '#F8F9FA')
       .setFontWeight(isTotal ? 'bold' : 'normal');
-    sheet.getRange(r, 2, 1, 4).setNumberFormat('#,##0').setHorizontalAlignment('right');
-    sheet.getRange(r, 6).setNumberFormat('0.0%').setHorizontalAlignment('right');
-    sheet.getRange(r, 7).setNumberFormat('#,##0').setHorizontalAlignment('right');
-    sheet.getRange(r, 8).setNumberFormat('0.0%').setHorizontalAlignment('right');
-    sheet.getRange(r, 9).setNumberFormat('#,##0').setHorizontalAlignment('right');
-    sheet.getRange(r, 10).setNumberFormat('0.0%').setHorizontalAlignment('right');
-    sheet.getRange(r, 11).setNumberFormat('#,##0').setHorizontalAlignment('right');
-    sheet.getRange(r, 12).setNumberFormat('0.0%').setHorizontalAlignment('right');
+
+    for (let c = 0; c < meetDomHeaders.length; c++) {
+      const val = meetDomRows[i][c];
+      const col = c + 1;
+      if (col === 1) {
+        sheet.getRange(r, col).setHorizontalAlignment('left');
+      } else if (typeof val === 'number') {
+        if ([6, 8, 10, 12].includes(col)) {
+          sheet.getRange(r, col).setNumberFormat('0.0%').setHorizontalAlignment('right');
+        } else {
+          sheet.getRange(r, col).setNumberFormat('#,##0').setHorizontalAlignment('right');
+        }
+      } else {
+        sheet.getRange(r, col).setHorizontalAlignment('center');
+      }
+    }
   }
 
   sheet
     .getRange(rowCursor, 1, meetDomRows.length + 1, meetDomHeaders.length)
     .setBorder(true, true, true, true, true, true, C.BORDER_LIGHT, SpreadsheetApp.BorderStyle.SOLID);
+
+  if (!isMeetGranular) {
+    const fnRow = meetDomStartRow + meetDomRows.length + 1;
+    sheet
+      .getRange(fnRow, 1, 1, meetDomHeaders.length)
+      .merge()
+      .setValue('* Note: Per-domain Meet conference breakdowns (screen sharing, recordings, livestreams, and 100+ participants) are populated via the dedicated "📹 Generate Granular Meet Usage Report" menu item.')
+      .setFontSize(8)
+      .setFontColor(C.TEXT_MUTED)
+      .setFontStyle('italic')
+      .setVerticalAlignment('middle');
+  }
 
   // Set clean column widths
   const colWidths = [220, 140, 110, 160, 130, 130, 120, 120, 120, 140, 140, 130];
@@ -3099,206 +3625,506 @@ function createSingleDomainScorecardModel_(orgModel, domRow) {
 
 /**
  * ============================================================================
- * SAMPLE / DEMO GENERATOR (MATCHES ATTACHED writercorporation.com SCORECARD)
+ * GRANULAR GOOGLE MEET USAGE & CONFERENCE SCORECARD REPORT
  * ============================================================================
- * Allows testing the exact visual layout and multi-domain tables immediately
- * using the numbers from the sample report (`writercorporation.com`: 2,063
- * Active Users, 2,850 Total Users, 72% adoption, Gmail 99%, Calendar 66%,
- * Drive 87%, Docs 28%, Sheets 56%, Slides 10%, Chat 68%, Meet 62%, Contacts 87%).
+ * Gathers 28-day daily Meet customer metrics (meetings, duration, calls) and
+ * processes Meet activity audit logs to attribute screen sharing, recordings,
+ * livestreams, large meetings (>100 participants), and per-domain metrics.
  */
-function generateSampleScorecardReport() {
+function runGranularMeetReport_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const activeUsers = 2063;
-  const totalUsers = 2850;
-  const samplePctMap = {
-    GMAIL: 0.99,
-    CALENDAR: 0.66,
-    DRIVE: 0.87,
-    DOCS: 0.28,
-    SHEETS: 0.56,
-    SLIDES: 0.10,
-    CHAT: 0.68,
-    MEET: 0.62,
-    CONTACTS: 0.87
-  };
+  toast_(ss, 'Discovering organization customer ID and registered domains...', 'Meet Usage Report');
+  const orgInfo = discoverOrganizationAndDomains_();
 
-  const products = {};
-  WORKSPACE_PRODUCTS.forEach((p) => {
-    const pctActive = samplePctMap[p.key];
-    const count28d = Math.round(activeUsers * pctActive);
-    products[p.key] = {
-      key: p.key,
-      label: p.label,
-      iconBadge: p.iconBadge,
-      badgeColor: p.badgeColor,
-      description: p.description,
-      activeUsers28d: count28d,
-      pctOfActiveUsers: pctActive,
-      pctOfActiveUsersRounded: Math.round(pctActive * 100),
-      pctOfTotalUsers: count28d / totalUsers,
-      pctOfActiveProvisioned: count28d / 2680,
-      activeUsers7d: Math.round(count28d * 0.84),
-      activeUsers1d: Math.round(count28d * 0.62)
-    };
+  toast_(ss, 'Determining 28-day computation window for Google Meet...', 'Meet Usage Report');
+  const windowInfo = findLatestAvailableReportDate_();
+
+  toast_(ss, 'Retrieving registered domains inventory...', 'Meet Usage Report');
+  const directoryData = fetchUserAndLicenseInventory_(orgInfo, windowInfo);
+
+  toast_(ss, 'Fetching 28-day daily Meet customer metrics (meetings, duration, calls)...', 'Meet Usage Report');
+  const customerUsage = fetchCustomerUsageMetrics_(windowInfo, orgInfo, directoryData, {
+    includeMeetGranularAudit: true
   });
 
-  // Split sample organization across 3 domains to demonstrate multi-domain reporting
-  const domainDefs = [
+  toast_(ss, 'Processing Meet activity audit logs (screencasts, recordings, streams, attendees)...', 'Meet Usage Report');
+  const meetAuditResult = processMeetActivityAudit28d_(
+    windowInfo,
+    orgInfo,
+    directoryData,
+    customerUsage
+  );
+
+  toast_(ss, 'Rendering dedicated Meet Usage Deep-Dive sheet...', 'Meet Usage Report');
+  const deepDiveSheet = renderMeetDeepDiveSheet_(
+    ss,
+    orgInfo,
+    windowInfo,
+    directoryData,
+    customerUsage,
+    meetAuditResult
+  );
+
+  // Update Adoption Scorecard sheet if present
+  const scorecardSheet = ss.getSheetByName(REPORT_CONFIG.SHEET_NAMES.SCORECARD);
+  if (scorecardSheet) {
+    renderMeetScorecardCards_(scorecardSheet, meetAuditResult.orgMeetMetrics, windowInfo.computationWindowDays, 24);
+  }
+
+  // Update Multi-Domain Breakdown sheet if present
+  const domainSheet = ss.getSheetByName(REPORT_CONFIG.SHEET_NAMES.DOMAIN_BREAKDOWN);
+  if (domainSheet) {
+    updateMeetTableOnDomainSheet_(domainSheet, directoryData, meetAuditResult);
+  }
+
+  if (directoryData && directoryData.userMaskMap) {
+    directoryData.userMaskMap.clear();
+  }
+
+  ss.setActiveSheet(deepDiveSheet);
+  SpreadsheetApp.flush();
+  toast_(ss, 'Granular Google Meet Usage Report and Deep-Dive sheet completed!', 'Complete', 8);
+
+  return {
+    orgInfo: orgInfo,
+    windowInfo: windowInfo,
+    meet: meetAuditResult.orgMeetMetrics,
+    domainMeet: meetAuditResult.domainMeetMetricsMap
+  };
+}
+
+/**
+ * Renders the 2x3 Meet Usage Scorecard Cards Grid (matching Google Scorecard design).
+ */
+function renderMeetScorecardCards_(sheet, m, windowDays, startRow) {
+  const C = REPORT_CONFIG.COLORS;
+  const baseRow = startRow || 24;
+  const isGranular = Boolean(m && m.isGranular);
+  const hasData = Boolean(m && m.hasData);
+  const cardColSets = [
+    { iconCol: 2, textStartCol: 3, endCol: 4 }, // B, C..D
+    { iconCol: 5, textStartCol: 6, endCol: 7 }, // E, F..G
+    { iconCol: 8, textStartCol: 9, endCol: 10 } // H, I..J
+  ];
+
+  const meetCardsRow1 = [
     {
-      name: 'writercorporation.com',
-      type: 'Primary Domain',
-      isPrimary: true,
-      aliases: ['writer-corp.com'],
-      totalUsers: 2100,
-      activeProv: 1990,
-      suspended: 80,
-      archived: 30,
-      active28d: 1560,
-      storageGb: 18420.5,
-      meetings: 3420,
-      avgMins: 34,
-      screencast: 1890,
-      recorded: 410,
-      livestream: 28,
-      over100: 19
+      badge: '📹 Meetings',
+      badgeColor: '#00897B',
+      primaryText: hasData ? formatNumber_(m.numMeetings) : '-',
+      secondaryText: hasData
+        ? `(${(m.numMeetings / windowDays).toFixed(1)} mtgs/day avg)`
+        : '(No data found in 28 days)',
+      caption: `Number of meetings in the past ${windowDays} days`
     },
     {
-      name: 'eu.writercorporation.com',
-      type: 'Secondary Domain',
-      isPrimary: false,
-      aliases: [],
-      totalUsers: 500,
-      activeProv: 460,
-      suspended: 25,
-      archived: 15,
-      active28d: 353,
-      storageGb: 4110.2,
-      meetings: 780,
-      avgMins: 31,
-      screencast: 420,
-      recorded: 85,
-      livestream: 6,
-      over100: 4
+      badge: '⏱️ Duration',
+      badgeColor: '#00897B',
+      primaryText: hasData && m.avgMeetingTimeMinutes > 0 ? `${formatNumber_(m.avgMeetingTimeMinutes)} min` : (hasData ? '-' : '-'),
+      secondaryText: hasData && m.totalMeetingMinutes > 0
+        ? `(${formatNumber_(m.totalMeetingMinutes)} total mins)`
+        : (hasData ? '(Customer report total)' : '(No data found in 28 days)'),
+      caption: `Average meeting time in minutes in the past ${windowDays} days`
     },
     {
-      name: 'labs.writercorporation.com',
-      type: 'Secondary Domain',
-      isPrimary: false,
-      aliases: [],
-      totalUsers: 250,
-      activeProv: 230,
-      suspended: 15,
-      archived: 5,
-      active28d: 150,
-      storageGb: 2150.8,
-      meetings: 310,
-      avgMins: 29,
-      screencast: 175,
-      recorded: 35,
-      livestream: 4,
-      over100: 2
+      badge: '🖥️ Share',
+      badgeColor: '#00897B',
+      primaryText: isGranular ? formatNumber_(m.numScreencastMeetings) : '—',
+      secondaryText: isGranular
+        ? `(${(m.pctScreencastMeetings * 100).toFixed(1)}% of meetings)`
+        : "(Run '📹 Granular Meet Report')",
+      caption: `Number of meetings that used screen sharing in the past ${windowDays} days`
     }
   ];
 
-  const domains = domainDefs.map((d) => {
-    const domProds = {};
-    WORKSPACE_PRODUCTS.forEach((p) => {
-      const cnt = Math.round(d.active28d * samplePctMap[p.key]);
-      domProds[p.key] = {
-        activeUsers28d: cnt,
-        directUsers28d: cnt,
-        pctOfDomainActiveUsers: cnt / d.active28d,
-        pctOfDomainTotalUsers: cnt / d.totalUsers
-      };
+  const meetCardsRow2 = [
+    {
+      badge: '⏺️ REC',
+      badgeColor: '#D93025',
+      primaryText: isGranular ? formatNumber_(m.numRecordedMeetings) : '—',
+      secondaryText: isGranular
+        ? `(${(m.pctRecordedMeetings * 100).toFixed(1)}% of meetings)`
+        : "(Run '📹 Granular Meet Report')",
+      caption: `Number of meetings that were recorded in the past ${windowDays} days`
+    },
+    {
+      badge: '📡 Live',
+      badgeColor: '#E37400',
+      primaryText: isGranular ? formatNumber_(m.numLiveStreamMeetings) : '—',
+      secondaryText: isGranular
+        ? `(${(m.pctLiveStreamMeetings * 100).toFixed(1)}% of meetings)`
+        : "(Run '📹 Granular Meet Report')",
+      caption: `Number of meetings that were live streamed in the past ${windowDays} days`
+    },
+    {
+      badge: '👥 100+',
+      badgeColor: '#00897B',
+      primaryText: isGranular ? formatNumber_(m.numOver100Meetings) : '—',
+      secondaryText: isGranular
+        ? `(${(m.pctOver100Meetings * 100).toFixed(1)}% of meetings)`
+        : "(Run '📹 Granular Meet Report')",
+      caption: `Number of meetings with more than 100 participants in the past ${windowDays} days`
+    }
+  ];
+
+  [
+    { startRow: baseRow, bg: C.CARD_WHITE_BG, cards: meetCardsRow1 },
+    { startRow: baseRow + 3, bg: C.CARD_GREY_BG, cards: meetCardsRow2 }
+  ].forEach((meetRowGroup) => {
+    const r = meetRowGroup.startRow;
+    sheet.setRowHeight(r, 36);
+    sheet.setRowHeight(r + 1, 16);
+    sheet.setRowHeight(r + 2, 30);
+    sheet.getRange(r, 2, 3, 9).setBackground(meetRowGroup.bg);
+
+    meetRowGroup.cards.forEach((card, idx) => {
+      const cols = cardColSets[idx];
+      sheet
+        .getRange(r, cols.iconCol, 2, 1)
+        .merge()
+        .setValue(card.badge)
+        .setBackground(card.badgeColor)
+        .setFontColor('#FFFFFF')
+        .setFontSize(9)
+        .setFontWeight('bold')
+        .setHorizontalAlignment('center')
+        .setVerticalAlignment('middle')
+        .setWrap(true);
+
+      const fullText = `${card.primaryText}  ${card.secondaryText}`;
+      const richMeet = SpreadsheetApp.newRichTextValue()
+        .setText(fullText)
+        .setTextStyle(
+          0,
+          card.primaryText.length,
+          SpreadsheetApp.newTextStyle()
+            .setFontSize(18)
+            .setForegroundColor(C.TEXT_SECONDARY)
+            .setBold(false)
+            .build()
+        )
+        .setTextStyle(
+          card.primaryText.length,
+          fullText.length,
+          SpreadsheetApp.newTextStyle()
+            .setFontSize(10)
+            .setForegroundColor(C.HERO_BLUE)
+            .setBold(true)
+            .build()
+        )
+        .build();
+
+      sheet
+        .getRange(r, cols.textStartCol, 2, 2)
+        .merge()
+        .setRichTextValue(richMeet)
+        .setHorizontalAlignment('left')
+        .setVerticalAlignment('middle');
+
+      sheet
+        .getRange(r + 2, cols.iconCol, 1, 3)
+        .merge()
+        .setValue(card.caption)
+        .setFontSize(9)
+        .setFontColor(C.TEXT_PRIMARY)
+        .setHorizontalAlignment('left')
+        .setVerticalAlignment('top')
+        .setWrap(true);
     });
-    return {
-      domainName: d.name,
-      domainType: d.type,
-      isPrimary: d.isPrimary,
-      isAlias: false,
-      verified: true,
-      aliases: d.aliases,
-      totalUsers: d.totalUsers,
-      activeProvisionedUsers: d.activeProv,
-      suspendedUsers: d.suspended,
-      archivedUsers: d.archived,
-      storageUsedGb: d.storageGb,
-      shareOfOrgUsers: d.totalUsers / totalUsers,
-      workspaceActiveUsers28d: d.active28d,
-      directWorkspaceActiveUsers28d: d.active28d,
-      workspaceAdoptionPct: d.active28d / d.totalUsers,
-      products: domProds,
-      meet: {
-        hasData: true,
-        numMeetings: d.meetings,
-        avgMeetingTimeMinutes: d.avgMins,
-        totalMeetingMinutes: d.meetings * d.avgMins,
-        numScreencastMeetings: d.screencast,
-        pctScreencastMeetings: d.screencast / d.meetings,
-        numRecordedMeetings: d.recorded,
-        pctRecordedMeetings: d.recorded / d.meetings,
-        numLiveStreamMeetings: d.livestream,
-        pctLiveStreamMeetings: d.livestream / d.meetings,
-        numOver100Meetings: d.over100,
-        pctOver100Meetings: d.over100 / d.meetings
-      }
-    };
+  });
+}
+
+/**
+ * Updates Table 3 on the `Multi-Domain Breakdown` sheet with granular Meet metrics.
+ */
+function updateMeetTableOnDomainSheet_(sheet, directoryData, meetAuditResult) {
+  const lastRow = sheet.getLastRow() || 100;
+  let tableHeaderRow = -1;
+  const colA = sheet.getRange(1, 1, Math.min(lastRow, 250), 1).getValues();
+  for (let r = 0; r < colA.length; r++) {
+    const val = String(colA[r][0] || '');
+    if (val.includes('PER-DOMAIN GOOGLE MEET USAGE BREAKDOWN')) {
+      tableHeaderRow = r + 1;
+      break;
+    }
+  }
+
+  if (tableHeaderRow === -1) return;
+
+  const dataStartRow = tableHeaderRow + 2;
+  const domainsList = Array.from(directoryData.domainStatsMap.values()).sort((a, b) => {
+    if (a.domainMeta.isPrimary && !b.domainMeta.isPrimary) return -1;
+    if (!a.domainMeta.isPrimary && b.domainMeta.isPrimary) return 1;
+    return b.totalUsers - a.totalUsers;
   });
 
-  const sampleModel = {
-    orgInfo: {
-      customerId: 'C01WRITERCORP',
-      primaryDomain: 'writercorporation.com',
-      orgDisplayName: 'Writer Corporation',
-      adminEmail: 'admin@writercorporation.com'
-    },
-    windowInfo: {
-      reportDateStr: '2026-04-29',
-      reportDateFormatted: 'Apr 29, 2026',
-      windowStartDateStr: '2026-04-02',
-      windowEndDateStr: '2026-04-29',
-      computationWindowDays: 28
-    },
-    summary: {
-      primaryDomain: 'writercorporation.com',
-      allDomainNames: domains.map((d) => d.domainName),
-      domainCount: domains.length,
-      activeUsers28d: activeUsers,
-      totalUsersLicenses: totalUsers,
-      totalAssignedLicenses: 2800,
-      totalProvisionedUsers: 2850,
-      activeProvisionedUsers: 2680,
-      suspendedUsers: 120,
-      archivedUsers: 50,
-      workspaceAdoptionPctRounded: 72,
-      workspaceAdoptionFraction: activeUsers / totalUsers,
-      totalStorageUsedGb: 24681.5,
-      logins1d: 1640,
-      logins7d: 1920,
-      logins30d: 2095
-    },
-    products: products,
-    meet: {
-      hasData: true,
-      numMeetings: 4510,
-      avgMeetingTimeMinutes: 33,
-      totalMeetingMinutes: 148830,
-      numScreencastMeetings: 2485,
-      pctScreencastMeetings: 2485 / 4510,
-      numRecordedMeetings: 530,
-      pctRecordedMeetings: 530 / 4510,
-      numLiveStreamMeetings: 38,
-      pctLiveStreamMeetings: 38 / 4510,
-      numOver100Meetings: 25,
-      pctOver100Meetings: 25 / 4510
-    },
-    domains: domains,
-    auditStats: { userReportRowsProcessed: 2850, eventsProcessedByApp: {} }
-  };
+  const updatedRows = domainsList.map((d) => {
+    const dMeet = (meetAuditResult.domainMeetMetricsMap && meetAuditResult.domainMeetMetricsMap.get(d.domainName)) || {
+      numMeetings: 0,
+      totalMeetingMinutes: 0,
+      avgMeetingTimeMinutes: 0,
+      numScreencastMeetings: 0,
+      pctScreencastMeetings: 0,
+      numRecordedMeetings: 0,
+      pctRecordedMeetings: 0,
+      numLiveStreamMeetings: 0,
+      pctLiveStreamMeetings: 0,
+      numOver100Meetings: 0,
+      pctOver100Meetings: 0
+    };
+    return [
+      d.domainName,
+      dMeet.numMeetings,
+      dMeet.totalMeetingMinutes,
+      dMeet.avgMeetingTimeMinutes,
+      dMeet.numScreencastMeetings,
+      dMeet.pctScreencastMeetings,
+      dMeet.numRecordedMeetings,
+      dMeet.pctRecordedMeetings,
+      dMeet.numLiveStreamMeetings,
+      dMeet.pctLiveStreamMeetings,
+      dMeet.numOver100Meetings,
+      dMeet.pctOver100Meetings
+    ];
+  });
 
-  renderAllReportSheets_(ss, sampleModel, { createPerDomainScorecardTabs: false });
-  toast_(ss, 'Sample writercorporation.com multi-domain report generated!', 'Sample Report', 6);
-  return sampleModel;
+  const om = meetAuditResult.orgMeetMetrics;
+  updatedRows.push([
+    'ALL DOMAINS (ORGANIZATION TOTAL)',
+    om.numMeetings,
+    om.totalMeetingMinutes,
+    om.avgMeetingTimeMinutes,
+    om.numScreencastMeetings,
+    om.pctScreencastMeetings,
+    om.numRecordedMeetings,
+    om.pctRecordedMeetings,
+    om.numLiveStreamMeetings,
+    om.pctLiveStreamMeetings,
+    om.numOver100Meetings,
+    om.pctOver100Meetings
+  ]);
+
+  sheet
+    .getRange(dataStartRow, 1, updatedRows.length, updatedRows[0].length)
+    .setValues(updatedRows);
+
+  for (let i = 0; i < updatedRows.length; i++) {
+    const r = dataStartRow + i;
+    for (let c = 1; c < updatedRows[i].length; c++) {
+      const col = c + 1;
+      const val = updatedRows[i][c];
+      if (typeof val === 'number') {
+        if ([6, 8, 10, 12].includes(col)) {
+          sheet.getRange(r, col).setNumberFormat('0.0%').setHorizontalAlignment('right');
+        } else {
+          sheet.getRange(r, col).setNumberFormat('#,##0').setHorizontalAlignment('right');
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Renders the dedicated `Meet Usage Deep-Dive` sheet.
+ */
+function renderMeetDeepDiveSheet_(ss, orgInfo, windowInfo, directoryData, customerUsage, meetAuditResult) {
+  const C = REPORT_CONFIG.COLORS;
+  const sheet = getOrResetSheet_(ss, REPORT_CONFIG.SHEET_NAMES.MEET_DEEP_DIVE, 2);
+  sheet.getRange('A1:Z100').setFontFamily('Arial');
+  sheet.setHiddenGridlines(true);
+
+  // Set column widths
+  const colWidths = [24, 200, 130, 110, 120, 130, 120, 120, 120, 120, 120, 130, 24];
+  colWidths.forEach((w, idx) => sheet.setColumnWidth(idx + 1, w));
+
+  // Row 1: Top Hero Banner
+  sheet.setRowHeight(1, 38);
+  sheet
+    .getRange('B1:L1')
+    .merge()
+    .setValue('📹 GOOGLE MEET USAGE & CONFERENCE SCORECARD — DEEP-DIVE REPORT')
+    .setBackground('#00897B')
+    .setFontColor('#FFFFFF')
+    .setFontSize(13)
+    .setFontWeight('bold')
+    .setVerticalAlignment('middle')
+    .setHorizontalAlignment('center');
+
+  // Metadata summary card (Rows 2..4)
+  sheet.setRowHeight(2, 22);
+  sheet.setRowHeight(3, 22);
+  sheet.setRowHeight(4, 22);
+
+  const m = meetAuditResult.orgMeetMetrics;
+  const windowDays = windowInfo.computationWindowDays || 28;
+
+  const totalUsers = directoryData.domainStatsMap
+    ? Array.from(directoryData.domainStatsMap.values()).reduce((a, b) => a + b.totalUsers, 0)
+    : 0;
+
+  const metaRows = [
+    [
+      'Organization / Domain:',
+      `${orgInfo.primaryDomain} (${orgInfo.customerId})`,
+      'Computation Window:',
+      `${windowInfo.windowStartDateStr} to ${windowInfo.windowEndDateStr} (${windowDays} days)`
+    ],
+    [
+      'Total Provisioned Users:',
+      formatNumber_(totalUsers),
+      'Analyzed Meetings (≥2 endpoints):',
+      formatNumber_(m.numMeetings)
+    ],
+    [
+      'Total Conference Minutes:',
+      `${formatNumber_(m.totalMeetingMinutes)} mins`,
+      'Average Meeting Duration:',
+      `${formatNumber_(m.avgMeetingTimeMinutes)} min/meeting`
+    ]
+  ];
+
+  sheet
+    .getRange(2, 2, 3, 4)
+    .setValues(metaRows)
+    .setFontSize(9)
+    .setVerticalAlignment('middle');
+  sheet.getRange(2, 2, 3, 1).setFontWeight('bold').setFontColor(C.TEXT_MUTED);
+  sheet.getRange(2, 4, 3, 1).setFontWeight('bold').setFontColor(C.TEXT_MUTED);
+  sheet.getRange(2, 3, 3, 1).setFontWeight('bold').setFontColor(C.TEXT_PRIMARY);
+  sheet.getRange(2, 5, 3, 1).setFontWeight('bold').setFontColor(C.TEXT_PRIMARY);
+
+  // Section Header: Scorecard Cards
+  renderSectionHeaderWithGoogleStripe_(sheet, 6, 'MEET SCORECARD METRICS (PAST 28 DAYS)');
+
+  // 6 Meet Cards in rows 8..13
+  renderMeetScorecardCards_(sheet, m, windowDays, 8);
+
+  // Section Header: Multi-Domain Breakdown
+  renderSectionHeaderWithGoogleStripe_(sheet, 15, 'MULTI-DOMAIN MEET CONFERENCE BREAKDOWN');
+
+  // Table header at row 17
+  const meetHeaders = [
+    'Domain Name',
+    'Domain Type',
+    'Total Users',
+    'Total Meetings (28d)',
+    'Total Meeting Minutes',
+    'Avg Duration (min)',
+    'Screen Sharing (#)',
+    'Screen Sharing (%)',
+    'Recorded (#)',
+    'Recorded (%)',
+    'Live Stream (#)',
+    'Meetings >100 (%)'
+  ];
+
+  sheet.setRowHeight(17, 28);
+  sheet
+    .getRange(17, 2, 1, meetHeaders.length)
+    .setValues([meetHeaders])
+    .setBackground(C.TABLE_SUBHEADER_BG)
+    .setFontWeight('bold')
+    .setFontSize(9)
+    .setHorizontalAlignment('center')
+    .setVerticalAlignment('middle')
+    .setWrap(true);
+
+  const domainsList = Array.from(directoryData.domainStatsMap.values()).sort((a, b) => {
+    if (a.domainMeta.isPrimary && !b.domainMeta.isPrimary) return -1;
+    if (!a.domainMeta.isPrimary && b.domainMeta.isPrimary) return 1;
+    return b.totalUsers - a.totalUsers;
+  });
+
+  const domainRows = domainsList.map((d) => {
+    const dMeet = (meetAuditResult.domainMeetMetricsMap && meetAuditResult.domainMeetMetricsMap.get(d.domainName)) || {
+      numMeetings: 0,
+      totalMeetingMinutes: 0,
+      avgMeetingTimeMinutes: 0,
+      numScreencastMeetings: 0,
+      pctScreencastMeetings: 0,
+      numRecordedMeetings: 0,
+      pctRecordedMeetings: 0,
+      numLiveStreamMeetings: 0,
+      pctLiveStreamMeetings: 0,
+      numOver100Meetings: 0,
+      pctOver100Meetings: 0
+    };
+    return [
+      d.domainName,
+      d.domainMeta.domainType || (d.domainMeta.isPrimary ? 'Primary Domain' : 'Secondary Domain'),
+      d.totalUsers,
+      dMeet.numMeetings,
+      dMeet.totalMeetingMinutes,
+      dMeet.avgMeetingTimeMinutes,
+      dMeet.numScreencastMeetings,
+      dMeet.pctScreencastMeetings,
+      dMeet.numRecordedMeetings,
+      dMeet.pctRecordedMeetings,
+      dMeet.numLiveStreamMeetings,
+      dMeet.pctOver100Meetings
+    ];
+  });
+
+  domainRows.push([
+    'ALL DOMAINS (ORGANIZATION TOTAL)',
+    'All Registered Domains',
+    totalUsers,
+    m.numMeetings,
+    m.totalMeetingMinutes,
+    m.avgMeetingTimeMinutes,
+    m.numScreencastMeetings,
+    m.pctScreencastMeetings,
+    m.numRecordedMeetings,
+    m.pctRecordedMeetings,
+    m.numLiveStreamMeetings,
+    m.pctOver100Meetings
+  ]);
+
+  sheet
+    .getRange(18, 2, domainRows.length, meetHeaders.length)
+    .setValues(domainRows)
+    .setFontSize(9)
+    .setVerticalAlignment('middle');
+
+  for (let i = 0; i < domainRows.length; i++) {
+    const r = 18 + i;
+    sheet.setRowHeight(r, 22);
+    const isTotal = i === domainRows.length - 1;
+    sheet
+      .getRange(r, 2, 1, meetHeaders.length)
+      .setBackground(isTotal ? '#E8F0FE' : i % 2 === 0 ? '#FFFFFF' : '#F8F9FA')
+      .setFontWeight(isTotal ? 'bold' : 'normal');
+
+    sheet.getRange(r, 4, 1, 4).setNumberFormat('#,##0').setHorizontalAlignment('right');
+    sheet.getRange(r, 8).setNumberFormat('#,##0').setHorizontalAlignment('right');
+    sheet.getRange(r, 9).setNumberFormat('0.0%').setHorizontalAlignment('right');
+    sheet.getRange(r, 10).setNumberFormat('#,##0').setHorizontalAlignment('right');
+    sheet.getRange(r, 11).setNumberFormat('0.0%').setHorizontalAlignment('right');
+    sheet.getRange(r, 12).setNumberFormat('#,##0').setHorizontalAlignment('right');
+    sheet.getRange(r, 13).setNumberFormat('0.0%').setHorizontalAlignment('right');
+  }
+
+  sheet
+    .getRange(17, 2, domainRows.length + 1, meetHeaders.length)
+    .setBorder(true, true, true, true, true, true, C.BORDER_LIGHT, SpreadsheetApp.BorderStyle.SOLID);
+
+  // Methodology notes at the bottom
+  const noteRow = 18 + domainRows.length + 2;
+  const notes = [
+    ['Google Meet Scoring Methodology & Qualification Criteria:'],
+    ['• Valid Meetings: Only conferences with at least 2 distinct participant endpoints (endpoints > 1) are counted, excluding 1-person lonely calls.'],
+    ['• Screen Sharing: Identified via presentation_started / presentation_stopped events and screencast transmission seconds > 0.'],
+    ['• Recordings & Livestreams: Captured via recording_activity, broadcast_activity, and explicit streaming consent audit logs.'],
+    ['• Large Meetings (>100): Identified via conferences with more than 100 participant endpoints in the 28-day window.']
+  ];
+  sheet
+    .getRange(noteRow, 2, notes.length, 1)
+    .setValues(notes)
+    .setFontSize(8)
+    .setFontColor(C.TEXT_MUTED);
+  sheet.getRange(noteRow, 2).setFontWeight('bold').setFontColor(C.TEXT_PRIMARY);
+
+  return sheet;
 }
 
 /**
@@ -3363,7 +4189,7 @@ function resolveUserEmail_(rawEmail, orgInfo, directoryData) {
   let email = rawEmail.toLowerCase().trim();
   if (!email.includes('@')) return '';
 
-  if (directoryData.usersByEmail.has(email)) {
+  if (directoryData && directoryData.usersByEmail && directoryData.usersByEmail.has(email)) {
     return email;
   }
 
@@ -3372,10 +4198,10 @@ function resolveUserEmail_(rawEmail, orgInfo, directoryData) {
   let domainPart = parts[1];
 
   // If the email uses a domain alias, rewrite to parent domain
-  if (orgInfo.aliasToParentDomain && orgInfo.aliasToParentDomain.has(domainPart)) {
+  if (orgInfo && orgInfo.aliasToParentDomain && orgInfo.aliasToParentDomain.has(domainPart)) {
     const mappedDomain = orgInfo.aliasToParentDomain.get(domainPart);
     const candidate = `${localPart}@${mappedDomain}`;
-    if (directoryData.usersByEmail.has(candidate)) {
+    if (directoryData && directoryData.usersByEmail && directoryData.usersByEmail.has(candidate)) {
       return candidate;
     }
     domainPart = mappedDomain;
@@ -3383,9 +4209,9 @@ function resolveUserEmail_(rawEmail, orgInfo, directoryData) {
   }
 
   // Check if the email is a registered user alias in that domain
-  if (directoryData.domainStatsMap.has(domainPart)) {
+  if (directoryData && directoryData.domainStatsMap && directoryData.domainStatsMap.has(domainPart)) {
     const dStats = directoryData.domainStatsMap.get(domainPart);
-    if (dStats.aliasEmailToPrimary.has(email)) {
+    if (dStats.aliasEmailToPrimary && dStats.aliasEmailToPrimary.has(email)) {
       return dStats.aliasEmailToPrimary.get(email);
     }
   }
@@ -3399,10 +4225,10 @@ function resolveUserEmail_(rawEmail, orgInfo, directoryData) {
 function isInternalOrgEmail_(email, orgInfo, directoryData) {
   if (!email || !email.includes('@')) return false;
   const domain = email.split('@')[1];
-  return (
-    directoryData.domainStatsMap.has(domain) ||
-    orgInfo.domainsMap.has(domain) ||
-    (orgInfo.aliasToParentDomain && orgInfo.aliasToParentDomain.has(domain))
+  return Boolean(
+    (directoryData && directoryData.domainStatsMap && directoryData.domainStatsMap.has(domain)) ||
+    (orgInfo && orgInfo.domainsMap && orgInfo.domainsMap.has(domain)) ||
+    (orgInfo && orgInfo.aliasToParentDomain && orgInfo.aliasToParentDomain.has(domain))
   );
 }
 
@@ -3411,7 +4237,7 @@ function isInternalOrgEmail_(email, orgInfo, directoryData) {
  * ensures their domain exists in `directoryData.domainStatsMap`.
  */
 function getOrCreateUserRecord_(email, paramMap, orgInfo, directoryData) {
-  if (directoryData.usersByEmail.has(email)) {
+  if (directoryData && directoryData.usersByEmail && directoryData.usersByEmail.has(email)) {
     return directoryData.usersByEmail.get(email);
   }
   const domain =
@@ -3419,15 +4245,15 @@ function getOrCreateUserRecord_(email, paramMap, orgInfo, directoryData) {
       ? String(paramMap['accounts:domain_name']).toLowerCase().trim()
       : '') || email.split('@')[1];
 
-  if (!directoryData.domainStatsMap.has(domain)) {
-    const meta = orgInfo.domainsMap.get(domain) || {
+  if (directoryData && directoryData.domainStatsMap && !directoryData.domainStatsMap.has(domain)) {
+    const meta = (orgInfo && orgInfo.domainsMap && orgInfo.domainsMap.get(domain)) || {
       domainName: domain,
-      isPrimary: domain === orgInfo.primaryDomain,
+      isPrimary: Boolean(orgInfo && domain === orgInfo.primaryDomain),
       verified: true,
-      domainType: domain === orgInfo.primaryDomain ? 'Primary Domain' : 'Secondary Domain',
+      domainType: orgInfo && domain === orgInfo.primaryDomain ? 'Primary Domain' : 'Secondary Domain',
       aliases: []
     };
-    orgInfo.domainsMap.set(domain, meta);
+    if (orgInfo && orgInfo.domainsMap) orgInfo.domainsMap.set(domain, meta);
     directoryData.domainStatsMap.set(domain, createEmptyDomainStats_(domain, meta));
   }
 
@@ -3447,13 +4273,17 @@ function getOrCreateUserRecord_(email, paramMap, orgInfo, directoryData) {
     activeProducts28d: new Set(),
     storageUsedMb: 0
   };
-  directoryData.usersByEmail.set(email, userRec);
+  if (directoryData && directoryData.usersByEmail) {
+    directoryData.usersByEmail.set(email, userRec);
+  }
 
-  const dStats = directoryData.domainStatsMap.get(domain);
-  dStats.totalUsers++;
-  if (isSuspended) dStats.suspendedUsers++;
-  else if (isArchived) dStats.archivedUsers++;
-  else dStats.activeProvisionedUsers++;
+  if (directoryData && directoryData.domainStatsMap && directoryData.domainStatsMap.has(domain)) {
+    const dStats = directoryData.domainStatsMap.get(domain);
+    dStats.totalUsers++;
+    if (isSuspended) dStats.suspendedUsers++;
+    else if (isArchived) dStats.archivedUsers++;
+    else dStats.activeProvisionedUsers++;
+  }
 
   return userRec;
 }
@@ -3462,9 +4292,17 @@ function getOrCreateUserRecord_(email, paramMap, orgInfo, directoryData) {
  * Marks a user active in a specific product and in overall Workspace (WORKSPACE_ALL).
  */
 function markUserProductActive_(userRec, domainStats, productKey) {
-  userRec.activeProducts28d.add(productKey);
-  if (domainStats && domainStats.productActiveUsersSets[productKey]) {
-    domainStats.productActiveUsersSets[productKey].add(userRec.email);
+  if (userRec) {
+    if (userRec.activeProducts28d && userRec.activeProducts28d.add) {
+      userRec.activeProducts28d.add(productKey);
+    }
+  }
+  if (domainStats) {
+    if (domainStats.productActiveUsersSets && domainStats.productActiveUsersSets[productKey] && domainStats.productActiveUsersSets[productKey].add) {
+      domainStats.productActiveUsersSets[productKey].add(userRec ? userRec.email : '');
+    } else if (domainStats.productCounts) {
+      domainStats.productCounts[productKey] = (domainStats.productCounts[productKey] || 0) + 1;
+    }
   }
   markUserActiveInWorkspace_(userRec, domainStats);
 }
@@ -3473,9 +4311,15 @@ function markUserProductActive_(userRec, domainStats, productKey) {
  * Marks a user active in overall Google Workspace (`WORKSPACE_ALL`) for the 28d window.
  */
 function markUserActiveInWorkspace_(userRec, domainStats) {
-  userRec.loggedIn28d = true;
+  if (userRec) {
+    userRec.loggedIn28d = true;
+  }
   if (domainStats) {
-    domainStats.activeWorkspaceUsersSet.add(userRec.email);
+    if (domainStats.activeWorkspaceUsersSet && domainStats.activeWorkspaceUsersSet.add) {
+      domainStats.activeWorkspaceUsersSet.add(userRec ? userRec.email : '');
+    } else if (domainStats.directWorkspaceActiveCount !== undefined) {
+      domainStats.directWorkspaceActiveCount++;
+    }
   }
 }
 
